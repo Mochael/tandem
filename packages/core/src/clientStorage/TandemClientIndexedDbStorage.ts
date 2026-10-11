@@ -4,14 +4,14 @@ import { deleteDB, openDB } from "idb"
 import type { DBSchema, IDBPDatabase } from "idb"
 import type { ScanStorageArgs, WriteOps } from "tuple-database"
 import { decodeTuple, encodeTuple } from "tuple-database/helpers/codec.js"
+import type { AnySchema, RuntimeSchemaDefinition } from "../schema/Schema.js"
 import type {
-	AnySchema,
-	RuntimeSchemaDefinition,
-	SchemaToTupleSchema,
-} from "../schema/Schema.js"
-import type { TandemClientStorageApi } from "./TandemClientStorage.js"
-import { Codec } from "../utils/Codec.js"
-import type { Json } from "../utils/typeUtils.js"
+	TandemClientStorageApi,
+	TandemClientTuple,
+} from "./TandemClientStorage.js"
+import type { MutationOp } from "../transaction/Transaction.js"
+import { codec, type Codec } from "../utils/Codec.js"
+import { unreachable, type Json } from "../utils/typeUtils.js"
 
 const version = 1
 
@@ -60,6 +60,62 @@ function getSchemaCodecs<
 	}
 }
 
+function createTupleCodec<Schema extends AnySchema>(
+	codecs: Record<string, Codec<unknown, unknown> | undefined>,
+): Codec<TandemClientTuple<Schema>, { key: string; value: unknown }> {
+	function transformValue(
+		tuple: TandemClientTuple<Schema>,
+		direction: "encode" | "decode",
+	): unknown {
+		switch (tuple.key[0]) {
+			case "record": {
+				const valueCodec = codecs?.[tuple.key[1]]
+				return valueCodec ? valueCodec[direction](tuple.value) : tuple.value
+			}
+			case "replica":
+				return tuple.value
+			case "outbox":
+				return (tuple.value as MutationOp<Schema>[]).map((op) => {
+					switch (op.type) {
+						case "set": {
+							const valueCodec = codecs?.[op.collection]
+							return valueCodec
+								? { ...op, value: valueCodec[direction](op.value) }
+								: op
+						}
+						case "remove":
+							return op
+						default:
+							return unreachable(op)
+					}
+				})
+			default:
+				return unreachable(tuple.key)
+		}
+	}
+	return codec(
+		"TandemClientTuple",
+		(input) => {
+			const tuple = input as TandemClientTuple<Schema>
+			return {
+				key: encodeTuple(tuple.key),
+				value: transformValue(tuple, "encode"),
+			}
+		},
+		(input) => {
+			const encoded = input as { key: string; value: unknown }
+			const tuple = {
+				key: decodeTuple(encoded.key),
+				value: encoded.value,
+			} as TandemClientTuple<Schema>
+			return {
+				key: tuple.key,
+				value: transformValue(tuple, "decode"),
+			} as TandemClientTuple<Schema>
+		},
+	)
+}
+
 export class TandemClientIndexedDbStorage<
 	Schema extends AnySchema,
 	StorageSchema extends {
@@ -67,9 +123,10 @@ export class TandemClientIndexedDbStorage<
 	} = Schema,
 > implements TandemClientStorageApi<Schema> {
 	private db: Promise<IDBPDatabase<TandemIndexedDbSchema>>
-	private codecs?: {
-		[K in keyof Schema]?: Codec<Schema[K], StorageSchema[K]>
-	}
+	private readonly tupleCodec: Codec<
+		TandemClientTuple<Schema>,
+		{ key: string; value: unknown }
+	>
 	private dbName: string
 
 	constructor({
@@ -77,12 +134,10 @@ export class TandemClientIndexedDbStorage<
 		schema,
 		codecs,
 	}: TandemClientIndexedDbStorageArgs<Schema, StorageSchema>) {
-		this.codecs = {
+		this.tupleCodec = createTupleCodec<Schema>({
 			...getSchemaCodecs(schema),
 			...codecs,
-		} as {
-			[K in keyof Schema]?: Codec<Schema[K], StorageSchema[K]>
-		}
+		})
 		this.dbName = dbName
 		this.db = openDB<TandemIndexedDbSchema>(dbName, version, {
 			upgrade(db) {
@@ -125,16 +180,11 @@ export class TandemClientIndexedDbStorage<
 		const direction = args?.reverse ? "prev" : "next"
 
 		const limit = args?.limit || Infinity
-		const results: SchemaToTupleSchema<Schema>[] = []
+		const results: TandemClientTuple<Schema>[] = []
 		for await (const cursor of index.iterate(range, direction)) {
-			const key = decodeTuple(cursor.key)
-			const recordType = key[1] as keyof Schema & string
-			const codec = this.codecs?.[recordType]
-			const value = codec ? codec.decode(cursor.value) : cursor.value
-
-			// IndexedDB and the tuple codec return untyped serialized data. The
-			// adapter is the boundary that restores the configured schema type.
-			results.push({ key, value } as SchemaToTupleSchema<Schema>)
+			results.push(
+				this.tupleCodec.decode({ key: cursor.key, value: cursor.value }),
+			)
 			if (results.length >= limit) break
 		}
 		await tx.done
@@ -142,17 +192,17 @@ export class TandemClientIndexedDbStorage<
 		return results
 	}
 
-	async commit(writes: WriteOps<SchemaToTupleSchema<Schema>>) {
+	async commit(writes: WriteOps<TandemClientTuple<Schema>>) {
+		// Finish codec work before opening a transaction so an encoding failure cannot persist a prefix.
+		const set = (writes.set ?? []).map((tuple) => this.tupleCodec.encode(tuple))
+		const remove = (writes.remove ?? []).map((key) => encodeTuple(key))
 		const db = await this.db
 		const tx = db.transaction(storeName, "readwrite")
-		for (const { key, value } of writes.set || []) {
-			const recordType = key[1] as keyof Schema & string
-			const codec = this.codecs?.[recordType]
-			const encodedValue = codec ? codec.encode(value) : value
-			await tx.store.put(encodedValue, encodeTuple(key))
+		for (const { key, value } of set) {
+			await tx.store.put(value, key)
 		}
-		for (const key of writes.remove || []) {
-			await tx.store.delete(encodeTuple(key))
+		for (const key of remove) {
+			await tx.store.delete(key)
 		}
 		await tx.done
 	}

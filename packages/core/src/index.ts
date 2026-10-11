@@ -28,7 +28,10 @@ export type {
 } from "./transaction/Transaction.js"
 export { MutationApi } from "./transaction/Transaction.js"
 export { TandemClientStorage } from "./clientStorage/TandemClientStorage.js"
-export type { TandemClientStorageApi } from "./clientStorage/TandemClientStorage.js"
+export type {
+	TandemClientStorageApi,
+	TandemClientTuple,
+} from "./clientStorage/TandemClientStorage.js"
 export { WriteOpsApi } from "./clientStorage/TandemClientStorage.js"
 export { TandemClientIndexedDbStorage } from "./clientStorage/TandemClientIndexedDbStorage.js"
 export type {

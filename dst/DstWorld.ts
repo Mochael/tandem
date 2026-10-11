@@ -13,7 +13,7 @@ import {
 	type RngApi,
 	type RuntimeSchemaDefinition,
 	t,
-	type SchemaToTupleSchema,
+	type TandemClientTuple,
 	TandemClient,
 	type TandemClientStorageApi,
 	type TimerApi,
@@ -96,7 +96,7 @@ function remoteWithPokeEvents(
 	}
 }
 
-type DstClientTuple = SchemaToTupleSchema<DstSchema>
+type DstClientTuple = TandemClientTuple<DstSchema>
 
 function roundTrip<Value>(value: Value): Value {
 	return JSON.parse(JSON.stringify(value)) as Value

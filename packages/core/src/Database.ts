@@ -1,3 +1,4 @@
+import { normalizeTupleBounds } from "tuple-database/helpers/sortedTupleArray.js"
 import {
 	InMemoryTupleStorage,
 	type ReadOnlyTupleDatabaseClientApi,
@@ -119,8 +120,10 @@ export class Database<
 		timer: TimerApi
 	}) {
 		this.logger.info({ message: "loading from storage" })
-		const results = await storage.scan()
-		this.tupleDb.commit({ set: results })
+		const records = (await storage.scan(
+			normalizeTupleBounds({ prefix: ["record"] }),
+		)) as SchemaToTupleSchema<Schema>[]
+		this.tupleDb.commit({ set: records })
 
 		let writeOpsQueue: WriteOps<SchemaToTupleSchema<Schema>> = {}
 
