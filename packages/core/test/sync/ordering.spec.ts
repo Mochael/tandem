@@ -2,6 +2,47 @@ import { describe, expect } from "vitest"
 import { test, todo } from "../fixtures.js"
 
 describe("Tandem client sync ordering", () => {
+	test("syncs a write committed synchronously by a subscription callback", async ({
+		gatekeeper,
+	}) => {
+		const { client1, client2 } = gatekeeper
+		client2.subscribe({ collection: "todos" })
+		let nestedCommit: ReturnType<typeof client1.commit> | undefined
+		let committed = false
+		const first = todo("first", { text: "Outer write" })
+		const second = todo("second", { text: "Subscriber write" })
+		const subscription = client1.subscribe(
+			{ collection: "todos" },
+			(records) => {
+				if (committed || !records.some((record) => record.id === first.id))
+					return
+				committed = true
+				const nestedTx = client1.transact()
+				nestedTx.set("todos", second)
+				nestedCommit = client1.commit(nestedTx)
+			},
+		)
+		const tx = client1.transact()
+		tx.set("todos", first)
+		await (
+			await client1.commit(tx)
+		).result
+		await (
+			await nestedCommit
+		)?.result
+		await (
+			await client1.pullFromRemote()
+		).result
+		await (
+			await client2.pullFromRemote()
+		).result
+
+		expect(committed).toBe(true)
+		expect(client1.query({ collection: "todos" })).toEqual([first, second])
+		expect(client2.query({ collection: "todos" })).toEqual([first, second])
+		subscription.destroy()
+	})
+
 	test("shows a newer edit while the previous push is in flight", async ({
 		gatekeeper,
 	}) => {

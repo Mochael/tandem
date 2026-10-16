@@ -1,14 +1,38 @@
-import type { TupleRootTransactionApi } from "tuple-database"
+import type {
+	TupleRootTransactionApi,
+	TupleTransactionApi,
+} from "tuple-database"
+import type {
+	TandemClientBase,
+	TandemClientTuple,
+} from "../clientStorage/TandemClientStorage.js"
 import type {
 	AnySchema,
+	CollectionIdPart,
 	CollectionIdTuple,
 	CollectionName,
 	CollectionScanArgs,
-	SchemaToTupleSchema,
 } from "../schema/Schema.js"
 import { collectionIdToTuple } from "../schema/Schema.js"
 import type { EncodedQuery, ScanWindow } from "../query/Query.js"
 import type { Tagged } from "../utils/typeUtils.js"
+
+// Namespace-wide reconciliation handles records from any collection in Schema.
+// Public collection methods below retain collection-specific record and ID types.
+export type TupleClientRecord<Schema extends AnySchema> = {
+	key: [collection: CollectionName<Schema>, ...id: CollectionIdPart[]]
+	value: Schema[CollectionName<Schema>]
+}
+
+export type TupleClientBase<Schema extends AnySchema> = {
+	key: TupleClientRecord<Schema>["key"]
+	value: TandemClientBase<Schema[CollectionName<Schema>]>
+}
+
+export type TupleClientOutbox<Schema extends AnySchema> = {
+	key: [MutationId]
+	value: MutationOp<Schema>[]
+}
 
 type CollectionTupleKey<
 	Schema extends AnySchema,
@@ -37,7 +61,7 @@ export function getCollectionTransaction<
 	Schema extends AnySchema,
 	Collection extends CollectionName<Schema>,
 >(
-	transaction: TupleRootTransactionApi<SchemaToTupleSchema<Schema>>,
+	transaction: TupleRootTransactionApi<TandemClientTuple<AnySchema>>,
 	collection: Collection,
 ): CollectionTransactionApi<Schema, Collection> {
 	// tuple-database's key filtering cannot reduce a mapped tuple union while
@@ -136,17 +160,46 @@ export class Transaction<Schema extends AnySchema> {
 	 */
 	readonly ops: MutationOp<Schema>[] = []
 
+	/** @internal */
+	readonly tupleDbTx: TupleRootTransactionApi<TandemClientTuple<AnySchema>>
+
 	constructor(
-		/**
-		 * @internal
-		 */
-		readonly tupleDbTx: TupleRootTransactionApi<SchemaToTupleSchema<Schema>>,
-	) {}
+		tupleDbTx: TupleRootTransactionApi<TandemClientTuple<AnySchema>>,
+	) {
+		this.tupleDbTx = tupleDbTx
+	}
+
+	// tuple-database cannot reduce our generic mapped schema by prefix. Each
+	// subspace fixes the namespace; these assertions restore Schema to its values.
+	// These are views of tupleDbTx, not independent transactions.
+	/** @internal */
+	get records() {
+		return this.tupleDbTx.subspace([
+			"record",
+		]) as unknown as TupleTransactionApi<TupleClientRecord<Schema>>
+	}
+
+	/** @internal */
+	get bases() {
+		return this.tupleDbTx.subspace(["base"]) as unknown as TupleTransactionApi<
+			TupleClientBase<Schema>
+		>
+	}
+
+	/** @internal */
+	get outbox() {
+		return this.tupleDbTx.subspace([
+			"outbox",
+		]) as unknown as TupleTransactionApi<TupleClientOutbox<Schema>>
+	}
 
 	list<Collection extends CollectionName<Schema>>(
 		collection: Collection,
 	): Readonly<Schema[Collection]>[] {
-		const transaction = getCollectionTransaction(this.tupleDbTx, collection)
+		const transaction = getCollectionTransaction<Schema, Collection>(
+			this.tupleDbTx,
+			collection,
+		)
 		const results = transaction.scan()
 
 		return results.map((result) => result.value)
@@ -156,7 +209,10 @@ export class Transaction<Schema extends AnySchema> {
 		collection: Collection,
 		args?: CollectionScanArgs<Schema[Collection]["id"]>,
 	): Readonly<Schema[Collection]>[] {
-		const transaction = getCollectionTransaction(this.tupleDbTx, collection)
+		const transaction = getCollectionTransaction<Schema, Collection>(
+			this.tupleDbTx,
+			collection,
+		)
 		const results = transaction.scan(args)
 
 		return results.map((result) => result.value)
@@ -170,9 +226,10 @@ export class Transaction<Schema extends AnySchema> {
 			Schema,
 			Collection
 		>
-		return getCollectionTransaction(this.tupleDbTx, collection).get(
-			tupleSchemaKey,
-		)
+		return getCollectionTransaction<Schema, Collection>(
+			this.tupleDbTx,
+			collection,
+		).get(tupleSchemaKey)
 	}
 
 	set<Collection extends CollectionName<Schema>>(
@@ -183,10 +240,10 @@ export class Transaction<Schema extends AnySchema> {
 			Schema,
 			Collection
 		>
-		getCollectionTransaction(this.tupleDbTx, collection).set(
-			tupleSchemaKey,
-			record,
-		)
+		getCollectionTransaction<Schema, Collection>(
+			this.tupleDbTx,
+			collection,
+		).set(tupleSchemaKey, record)
 		this.ops.push({ type: "set", collection, value: record })
 
 		return this
@@ -206,7 +263,10 @@ export class Transaction<Schema extends AnySchema> {
 			Collection
 		>
 
-		const transaction = getCollectionTransaction(this.tupleDbTx, collection)
+		const transaction = getCollectionTransaction<Schema, Collection>(
+			this.tupleDbTx,
+			collection,
+		)
 		const prevRecord = transaction.get(tupleSchemaKey)
 		if (prevRecord === undefined) return this
 
@@ -230,7 +290,10 @@ export class Transaction<Schema extends AnySchema> {
 			Collection
 		>
 
-		getCollectionTransaction(this.tupleDbTx, collection).remove(tupleSchemaKey)
+		getCollectionTransaction<Schema, Collection>(
+			this.tupleDbTx,
+			collection,
+		).remove(tupleSchemaKey)
 		// Recorded even when the record isn't local, so the server removes it too.
 		this.ops.push({ type: "remove", collection, id })
 

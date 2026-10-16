@@ -12,7 +12,6 @@ import { randomId, type RngApi } from "../utils/randomId.js"
 import { TaskQueue } from "../utils/TaskQueue.js"
 import { Timer, type TimerApi } from "../utils/Timer.js"
 import { tag } from "../utils/typeUtils.js"
-import { PendingWrites } from "./PendingWrites.js"
 import type {
 	AsyncUnsubscribe,
 	Tagged,
@@ -119,11 +118,10 @@ export type SyncEngineArgs<Schema extends AnySchema> = {
 
 export class SyncEngine<Schema extends AnySchema> {
 	private syncQueue: TaskQueue<"pull" | "push">
-	private readonly pendingWrites = new PendingWrites<Schema>()
 	private mutationCount = 0
 	private readonly db: Pick<
 		Database<Schema>,
-		"get" | "commit" | "makeTupleDbTransaction" | "clear"
+		"outbox" | "commitMutation" | "applyPull" | "clear"
 	>
 	private readonly remote: RemoteApi<Schema>
 	private readonly logger: LoggerApi
@@ -131,7 +129,6 @@ export class SyncEngine<Schema extends AnySchema> {
 
 	private currentClientId: ClientId
 	private cookie?: Cookie
-
 	private disconnectFromRemote?: AsyncUnsubscribe
 	private scanWindow: ScanWindow<Schema> = []
 
@@ -176,7 +173,7 @@ export class SyncEngine<Schema extends AnySchema> {
 		const connected = await this.connectToRemote()
 		if (connected instanceof Error) throw connected
 		await this.queuePull()
-		if (!this.pendingWrites.isEmpty) {
+		if (this.db.outbox.scan({ limit: 1 }).length) {
 			await this.syncQueue.enqueue("push")
 		}
 		return () => this.disconnect()
@@ -262,28 +259,33 @@ export class SyncEngine<Schema extends AnySchema> {
 			patch: PatchApi.toString(patch),
 		})
 
-		const tx = this.db.makeTupleDbTransaction()
-		this.pendingWrites.applyPull(tx, { patch, lastMutationId })
-		tx.commit()
-		this.cookie = cookie
+		this.db.applyPull(response)
+		if (clientId === this.clientId) this.cookie = cookie
 	}
 
 	commit(transaction: Transaction<Schema>): Promise<void> {
-		const mutation: Mutation<Schema> = {
-			ops: transaction.ops,
-			id: tag<MutationId>(this.mutationCount + 1),
-		}
-		this.pendingWrites.commitAndTrack(mutation, {
-			readCommittedRecord: ({ collection, id }) => this.db.get(collection, id),
-			commit: () => this.db.commit(transaction),
-		})
-		this.mutationCount += 1
+		const clientId = this.clientId
+		// A synchronous subscriber can commit again before this call returns.
+		// Its ID must account for the outbox entry already published by the outer commit.
+		const id = tag<MutationId>(
+			Math.max(
+				this.mutationCount,
+				this.db.outbox.scan({ reverse: true, limit: 1 })[0]?.key[0] ?? 0,
+			) + 1,
+		)
+		this.db.commitMutation(transaction, id)
+		if (clientId === this.clientId)
+			this.mutationCount = Math.max(this.mutationCount, id)
 		this.logger.info({ message: "queueing push" })
 		return this.syncQueue.enqueue("push")
 	}
 
 	private async push() {
-		if (this.pendingWrites.isEmpty) return
+		const mutations = this.db.outbox.scan().map(({ key, value }) => ({
+			id: key[0],
+			ops: value,
+		}))
+		if (!mutations.length) return
 
 		if (!this.disconnectFromRemote) {
 			this.logger.info({ message: "skipping push while disconnected" })
@@ -291,7 +293,7 @@ export class SyncEngine<Schema extends AnySchema> {
 		}
 
 		const response = await this.remote.push({
-			mutations: this.pendingWrites.snapshot(),
+			mutations,
 			clientId: this.clientId,
 		})
 		if ("error" in response) {
@@ -305,7 +307,6 @@ export class SyncEngine<Schema extends AnySchema> {
 		this.currentClientId = tag<ClientId>(this.rng.randomId())
 		this.mutationCount = 0
 		this.cookie = undefined
-		this.pendingWrites.clearAll()
 		await Promise.all([this.db.clear(), unsubscribe?.()])
 		// Preserve connection state, but leave the database empty until a later pull.
 		if (!unsubscribe) return

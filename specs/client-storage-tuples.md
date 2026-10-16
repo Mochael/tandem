@@ -1,6 +1,6 @@
 # Client storage tuples
 
-This walkthrough covers persistence step 1: the storage-schema foundation. It does not describe durable offline writes as implemented. The embedded patches capture this implementation against its parent revision.
+Phase 1 is committed. Phase 2 is implemented and verified locally: optimistic records, sparse server bases, and the outbox share one database transaction. The full-confirmed-replica and `["visible"]` proposal is replaced. Complete checkpoint persistence and restart recovery remain planned in phases 3 and 4.
 
 ## Problem overview
 
@@ -20,30 +20,38 @@ An outbox `set` must restore the same runtime value as an ordinary record. For e
 
 ## Solution overview
 
-Keep the tuple-storage operations. Expand their accepted tuple schema and make codec dispatch distinguish the namespaces. No separate metadata store, outbox store, or new storage method is introduced.
+Keep the tuple-storage operations and the application-record namespace. Local changes continue to write directly to `["record"]`. Store pending mutations and their sparse server base in sibling tuple namespaces, instead of a separate array and map. No full confirmed-record copy, `["visible"]` projection, or new storage method is needed.
 
 ```ts
-// Simplified shape; actual declarations are linked below.
+// Current tuple schema. Replica metadata is not wired into sync yet.
 type ReplicaTuples =
   | { key: ["record", collection, ...id]; value: ApplicationRecord }
   | {
       key: ["replica"];
       value: { clientId: ClientId; lastIssuedMutationId: MutationId; cookie?: Cookie };
     }
-  | { key: ["outbox", MutationId]; value: MutationOp[] };
+  | { key: ["outbox", MutationId]; value: MutationOp[] }
+  | {
+      key: ["base", collection, ...id];
+      value: {
+        server: { type: "set"; value: ApplicationRecord } | { type: "remove" };
+        lastWrittenBy: MutationId;
+      };
+    };
 ```
 
-The outbox key owns the mutation ID; its value holds operations in their original order. `lastIssuedMutationId` and the cookie remain distinct: one prevents mutation-ID reuse, while the other identifies a pulled view.
+The outbox key owns the mutation ID; its value holds operations in their original order. A base entry exists only for a record touched by an unacknowledged mutation. It preserves the latest known server value, including explicit absence, and the newest pending mutation that touches the record. `lastIssuedMutationId` and the cookie remain distinct: one prevents mutation-ID reuse, while the other identifies a pulled view.
 
 ## Goals
 
 - Represent records, replica metadata, and pending operations in one typed tuple schema.
-- Round-trip custom application values both directly and inside outbox operations.
-- Keep existing application queries and sync behavior unchanged in this first step.
+- Round-trip custom application values inside records, outbox operations, and base entries.
+- Keep application queries and the existing reconciliation algorithm while moving pending state into tuples.
+- Persist complete checkpoints and restore them before reconnecting, so offline writes survive restart.
 
 ## Non-goals
 
-This change does not make `SyncEngine` persist or restore its identity, cookie, counter, or pending mutations. It does not implement confirmed-only record storage, startup replay, a durability promise for `commit()`, persistence-queue serialization, or automatic retries. The application still persists its visible records today.
+Phase 1 alone does not provide durable offline writes. Later phases do not introduce confirmed-only record storage, a separate visible namespace, automatic network retries, backoff, or a confirming-pull loop. Storage continues to accept tuple scans and commits; atomic checkpointing, not a new storage API, provides durability.
 
 ## Implementation
 
@@ -103,43 +111,412 @@ Verification exercises the adapter through its public API: close and reopen a mi
 
 The implementation passed `pnpm build`, `pnpm test` (146 tests), `pnpm type-check`, `pnpm lint`, formatting checks, and `git diff --check`. These checks verify this schema foundation, not crash-safe outbox delivery.
 
-### Phase 2: Connect the tuple schema to durable sync state
+### ✅ Phase 2: Move PendingWrites state into database tuples
 
 **Today**
 
-`SyncEngine` and `PendingWrites` still own memory-only sync state. `Database` still persists visible application records through its existing queue.
+Before this phase, `SyncEngine` owns `PendingWrites`. That class stores an ordered mutation array and a sparse base map whose entries contain a server operation and `lastWrittenBy`. Application records already contain optimistic changes.
 
 **Proposed**
 
-Use root tuple transactions for confirmed records, replica metadata, and the outbox; derive the visible records by replaying pending operations. Make persistence completion reliable before changing startup and delivery semantics. This is follow-up work, not part of the current diff.
+Replace the mutation array with `["outbox", mutationId]` tuples and the base map with `["base", collection, ...id]` tuples. Preserve the reconciliation algorithm and write optimistic changes directly into `["record"]`. Stage record changes and pending-state changes in the same root transaction. This phase is implemented; identity, cookie, and the counter remain in `SyncEngine` until phase 3.
 
-The eventual lifecycle must restore state before connecting and persist a local mutation before sending it:
+`Database.commitMutation` preserves an existing base's server value or captures the committed record when first tracking it. It reads the current database outside the draft so it neither captures an optimistic edit nor adds bookkeeping keys to the user's read set. Every touched base advances `lastWrittenBy`. The outbox stores a copy of the operation list in its original order.
+
+```callstack
+ SyncEngine.commit [[sync2:new:267-278]]
+-├── PendingWrites.commitAndTrack [[sync2:old:276-279]]
++├── Database.commitMutation [[database2:new:238-254]]
++│  ├── capture or retain sparse server bases and advance lastWrittenBy [[database2:new:240-251]]
++│  ├── stage the ordered outbox entry [[database2:new:253]]
++│  └── TupleRootTransaction.commit # publish records and pending state together [[database2:new:254]]
+ └── enqueue the push
+```
+
+The counter advances only after a successful commit. ID allocation also considers the already-published outbox: a synchronous subscription callback can commit before the outer call returns. This prevents duplicate IDs and lost writes. A rejected draft publishes no records, bases, or mutation and consumes no ID.
+
+`Database` and `Transaction` expose typed record, base, and outbox subspaces. Their getters only call `subspace` and assert its type, with comments explaining why tuple-database cannot reduce the generic namespace filter. Transaction views share the original root transaction.
+
+```callstack
+ Database.applyPull [[database2:new:257-260]]
++├── Transaction.records # select the record namespace on the same transaction [[transaction2:new:175-180]]
++├── Transaction.bases # select the base namespace on the same transaction [[transaction2:new:182-187]]
++└── Transaction.outbox # select the outbox namespace on the same transaction [[transaction2:new:189-194]]
+```
+
+Record and base views accept the schema's record union for cross-collection reconciliation; public collection methods and the durable tuple schema retain collection-specific record and ID types. No pending-mutation wrapper remains. Storage removes and restores the record prefix using tuple-database's helpers, with assertions at that key-conversion boundary because those helpers erase tuple types.
+
+Push reads the outbox in mutation-ID order. Neither push success nor failure removes an entry; only a pull acknowledgement does. `TandemClientBase` describes sparse server values. The tuple codec now transforms nested base set values, just as it transforms nested outbox set values. A base removal marker passes through unchanged. The storage API itself stays the same.
+
+```callstack
+ SyncEngine.push [[packages/core/src/sync/SyncEngine.ts#SyncEngine.push]]
+-├── PendingWrites.snapshot [[sync2:old:294]]
++├── Database.outbox # select the typed subspace [[database2:new:121-125]]
++├── scan outbox tuples and build the push payload [[sync2:new:284-287]]
+ └── RemoteApi.push
+```
+
+A pull updates application records and any tracked server bases, removes acknowledged outbox entries, restores tracked records to their server values, and replays the remaining operations. Base entries whose newest writer was acknowledged are removed only after restoration. Otherwise an acknowledged optimistic record absent from the server's scan window could remain visible.
+
+```callstack
+ SyncEngine.pull [[packages/core/src/sync/SyncEngine.ts#SyncEngine.pull]]
+-├── PendingWrites.applyPull [[sync2:old:265-268]]
++└── Database.applyPull [[database2:new:257-294]]
++   ├── Database.applyServerOp # apply patches and update tracked bases [[database2:new:297-320]]
++   ├── remove outbox IDs at or below lastMutationId [[database2:new:271-272]]
++   ├── restore tracked records from their updated bases [[database2:new:273-285]]
++   ├── applyOp # replay remaining operations in order [[database2:new:286-289]]
++   ├── remove fully acknowledged bases after restoration [[database2:new:290-293]]
++   └── TupleRootTransaction.commit # publish every staged write once [[database2:new:294]]
+```
+
+Pull writes follow ordinary write-based conflict detection. They are not filtered by structural equality or by whether a removed record already exists. An intervening write can invalidate an open draft even when replay restores the same visible record. Snapshot resends and replay can also cause conservative conflicts without a new application mutation. Field-level patches and distinguishing new mutations from synchronization bookkeeping remain deferred.
+
+On reset, clear only application records and mark every tracked base as absent before applying the snapshot. Preserve the outbox until acknowledgement. Replay one operation at a time: tuple-database's batch `write()` applies removes before sets and would otherwise reorder a mutation that sets and then removes the same record.
+
+Explicit `clear()` discards records, bases, and the outbox and retains the existing fresh-session behavior. Local-only clients keep their direct record commits and do not create pending state. The in-memory tuple database uses `TandemClientTuple<AnySchema>` because tuple-database cannot narrow generic mapped keys; application methods and the storage boundary retain their schema-specific types. There is one database and no second record projection.
+
+Initial phase 2 verification passed `pnpm build`, `pnpm type-check`, `pnpm test` (149 tests), `pnpm lint`, formatting checks, and `git diff --check`. Consumer regressions cover nested subscription commits and rejected drafts leaving no ghost mutation or ID gap. The original draft-survival expectation is replaced by write-based conflict detection: a pull rejects the stale draft without publishing partial writes, and a fresh transaction delivers the pending edits. That revised regression fails with equality filtering enabled and passes after removing it. The adapter test also restores codec-backed base values and explicit absence after reopening IndexedDB.
+
+Two DST sweeps passed 32 runs each, with 500 steps per run and zero violations, nondeterminism, or errors. Seeds 2026101500–2026101531 use fault rate 0.15 without crashes; seeds 2026101600–2026101631 use fault rate 0.1 and crash rate 0.05. These sweeps verify convergence after draining calls. This phase does not persist or restore the outbox and therefore does not establish durable offline delivery.
+
+After the subspace-wrapper refactor, the same build, type, lint, and 149-test checks passed again. A further sweep passed seeds 2026101700–2026101715 with 500 steps, fault rate 0.1, and crash rate 0.05, with zero violations, nondeterminism, or errors.
+
+After removing equality filtering, the build, type checks, lint, and all 149 tests passed. The updated conflict regression failed before the fix and passed afterward. Two additional 16-run DST sweeps passed with 500 steps per run: seeds 2026101800–2026101815 at fault rate 0.15 without crashes, and seeds 2026101900–2026101915 at fault rate 0.1 and crash rate 0.05. Both reported zero violations, nondeterminism, or errors. Temporary public-client probes also verified changed Map values reach clients through ordinary and reset pulls; those probes were removed after validation.
+
+### Phase 3: Persist complete checkpoints before delivery
+
+**Today**
+
+After phase 2, records and pending-write state are transactional in memory, but storage still saves only the application-record cache. `SyncEngine` still keeps identity, cookie, and the counter in fields. The existing storage queue does not provide an ordered durability barrier.
+
+**Proposed**
+
+Move identity, `lastIssuedMutationId`, and cookie into `["replica"]` and include their changes in the same root transactions as records, bases, and outbox entries. Persist every namespace through `TandemClientStorageApi.commit`. Optimistic records are safe to persist when their base and outbox are part of the same atomic checkpoint; there is no need to persist only confirmed records.
+
+Storage batches must run serially. A commit arriving while one batch is in flight belongs to a later batch. A failed batch must retain both its changes and newer queued changes in order; logging the failure or replacing the newer queue with the failed copy is not sufficient. `flushClientStorage()` must wait for queued and in-flight writes without letting an already-scheduled throttle tick duplicate or overtake them. Explicit clear must also be ordered against old batches so they cannot resurrect discarded state.
+
+A local write stays immediately visible, but its network delivery waits for its checkpoint. Preserve the public commit promise's existing push-attempt result, adding storage failure as a rejection before any push. A failed checkpoint leaves the mutation pending and unsent; automatic retry remains outside this plan.
+
+The durability barrier must cover the entire push snapshot, not just the commit that queued it. That snapshot can include newer mutations whose storage batches are still in flight. Capture the client identity with the snapshot and recheck the session after waiting, so an intervening clear cannot send old mutations under a new identity.
+
+```callstack
+ SyncEngine.commit [[packages/core/src/sync/SyncEngine.ts#SyncEngine.commit]]
++├── stage records, bases, outbox, and replica metadata together
+ ├── Database.commit # publish the in-memory transaction
++├── await the ordered storage checkpoint
+ └── enqueue the push # do not send a mutation before it is durable
+```
+
+A pull checkpoint must atomically contain its record patch, updated bases, acknowledgement pruning, and cookie. Restart then sees either the previous checkpoint or the complete newer one, never an acknowledged outbox without the records that justified removing it. Verify ordering and failure propagation with delayed and failing storage commits before wiring startup recovery.
+
+### Phase 4: Restore the checkpoint before connecting and replay the outbox
+
+**Today**
+
+After phase 3, storage contains complete checkpoints, but `Database.loadFromStorage` still scans only `["record"]`. Construction still creates a fresh identity and can auto-connect before loading finishes. Restart cannot yet resume the saved session.
+
+**Proposed**
+
+Load records, bases, outbox, and replica metadata before accepting synchronized writes or connecting. Restore the saved identity, counter, and cookie rather than overwriting them during `SyncEngine` construction. For a fresh store, initialize and persist replica metadata before its first connection. Resolve `TandemClient.ready` after hydration; both automatic and explicit connection must wait for it.
+
+The saved records already contain optimistic state. To verify that view, restore tracked records from their bases and replay the outbox in order; records without a base remain unchanged. No full confirmed-record scan or second materialized namespace is needed.
 
 ```callstack
  TandemClient [[packages/core/src/TandemClient.ts#TandemClient]]
-+├── restore replica metadata and confirmed records
-+├── rebuild PendingWrites from the outbox
++├── Database.loadFromStorage # load every checkpoint namespace
++├── restore tracked records and replay the outbox
 +├── resolve ready after hydration
  └── SyncEngine.connect [[packages/core/src/sync/SyncEngine.ts#SyncEngine.connect]]
-    ├── pull a server acknowledgement or reset
-    └── push remaining durable mutations
+    ├── pull using the restored identity and cookie
+    │  └── checkpoint the acknowledgement or reset
+    └── push remaining durable mutations in ID order
 ```
 
-A later pull must update confirmed records, prune the acknowledged outbox prefix, and save its cookie in one durable transaction. The existing server mutation deduplication and reset protocol remain the recovery mechanisms.
+Keep the existing pull-first reconnect order. The server's acknowledgement prunes writes it already accepted; remaining mutations retain their original IDs. Existing server mutation deduplication handles retransmission, and a missing or mismatched cookie still requests a reset. A reset must retain unacknowledged writes and replay them on the new server base.
+
+Validate actual restart recovery: recreate a client after a durable offline write, after a lost push response, and around pull checkpoint completion. Assert that pending sets and removals survive, already accepted writes are not applied twice, IDs do not restart at one, and clients converge after calls drain. Extend DST restart coverage to these durable cases; convergence-only sweeps do not establish that unsent offline writes survived a crash.
 
 ## References
 
 - `packages/core/src/clientStorage/TandemClientStorage.ts` — tuple schema and storage contract.
 - `packages/core/src/clientStorage/TandemClientIndexedDbStorage.ts` — codec dispatch and IndexedDB batches.
-- `packages/core/src/Database.ts` — current record-cache loading and persistence.
+- `packages/core/src/Database.ts` — transaction boundary and current record-cache loading.
+- `packages/core/src/sync/SyncEngine.ts` — delivery, acknowledgements, and connection lifecycle.
+- `packages/core/src/utils/ThrottleQueue.ts` — current batching and flush behavior to revise for durability.
 - `packages/core/test/persistence.spec.ts` — mixed-tuple and codec-failure regressions.
 - `packages/core/src/clientStorage/TandemClientStorage.types.ts` — storage type contracts.
 - `dst/DstWorld.ts` — simulation storage adapter using the same tuple schema.
 
 ## Source patches
 
-The following patches are copied from Git for the current working tree. Select linked call-stack rows to inspect the corresponding old or new lines.
+Phase 2 patch excerpts come first, followed by the committed phase 1 patches. Phases 3 and 4 have no implementation patches yet. Select linked call-stack rows to inspect old or new lines. Phase 2 excerpts omit context lines so embedded patch indentation does not conflict with Markdown whitespace checks.
 
+```source-diff:database2:packages/core/src/Database.ts
+diff --git a/packages/core/src/Database.ts b/packages/core/src/Database.ts
+index 98f80ea..897841c 100644
+--- a/packages/core/src/Database.ts
++++ b/packages/core/src/Database.ts
+@@ -61,0 +107,20 @@ export class Database<
++	// tuple-database cannot reduce namespace filters over our generic mapped schema.
++	// The prefix fixes the namespace, so only these views assert its Schema-specific values.
++	private get records() {
++		return this.tupleDb.subspace(["record"]) as unknown as TupleDatabaseClient<
++			TupleClientRecord<Schema>
++		>
++	}
++
++	private get bases() {
++		return this.tupleDb.subspace(["base"]) as unknown as TupleDatabaseClient<
++			TupleClientBase<Schema>
++		>
++	}
++
++	get outbox() {
++		return this.tupleDb.subspace(["outbox"]) as unknown as TupleDatabaseClient<
++			TupleClientOutbox<Schema>
++		>
++	}
++
+@@ -189,0 +238,85 @@ export class Database<
++	commitMutation(transaction: Transaction<Schema>, id: MutationId): void {
++		const tx = transaction.tupleDbTx
++		for (const op of transaction.ops) {
++			const recordKey = mutationOpToRecordKey(op)
++			// Pending bookkeeping reads the current checkpoint, not the user's draft read set.
++			const base = this.bases.get(recordKey)
++			// The draft already contains optimistic edits; capture the committed record instead.
++			const value = this.records.get(recordKey)
++			transaction.bases.set(recordKey, {
++				server:
++					base?.server ??
++					(value === undefined ? { type: "remove" } : { type: "set", value }),
++				lastWrittenBy: id,
++			})
++		}
++		transaction.outbox.set([id], [...transaction.ops])
++		tx.commit()
++	}
++
++	applyPull({ patch, lastMutationId }: PullResponse<Schema>): void {
++		const transaction = this.transact()
++		const tx = transaction.tupleDbTx
++		const { records, bases, outbox } = transaction
++		if (patch.reset) {
++			for (const { key } of records.scan()) records.remove(key)
++			for (const { key, value } of bases.scan()) {
++				bases.set(key, { ...value, server: { type: "remove" } })
++			}
++		}
++		for (const op of patch.set ?? [])
++			this.applyServerOp(transaction, { type: "set", ...op })
++		for (const op of patch.remove ?? [])
++			this.applyServerOp(transaction, { type: "remove", ...op })
++		for (const { key } of outbox.scan({ lte: [lastMutationId] }))
++			outbox.remove(key)
++		const trackedBases = bases.scan()
++		for (const { key, value } of trackedBases) {
++			switch (value.server.type) {
++				case "set":
++					records.set(key, value.server.value)
++					break
++				case "remove":
++					records.remove(key)
++					break
++				default:
++					unreachable(value.server)
++			}
++		}
++		// Preserve mutation and operation order; write() reorders removes before sets.
++		for (const { value: ops } of outbox.scan()) {
++			for (const op of ops) applyOp(transaction, op)
++		}
++		// Restoration still needs acknowledged bases, especially for records outside the scan window.
++		for (const { key, value } of trackedBases) {
++			if (value.lastWrittenBy <= lastMutationId) bases.remove(key)
++		}
++		tx.commit()
++	}
++
++	private applyServerOp(
++		transaction: Transaction<Schema>,
++		op: MutationOp<Schema>,
++	): void {
++		const recordKey = mutationOpToRecordKey(op)
++		const base = transaction.bases.get(recordKey)
++		if (base) {
++			const server: TandemClientBase<Schema[CollectionName<Schema>]>["server"] =
++				(() => {
++					switch (op.type) {
++						case "set":
++							return { type: "set", value: op.value }
++						case "remove":
++							return { type: "remove" }
++						default:
++							return unreachable(op)
++					}
++				})()
++			transaction.bases.set(recordKey, {
++				...base,
++				server,
++			})
++		}
++		applyOp(transaction, op)
++	}
++
+```
+
+```source-diff:sync2:packages/core/src/sync/SyncEngine.ts
+diff --git a/packages/core/src/sync/SyncEngine.ts b/packages/core/src/sync/SyncEngine.ts
+index 4100127..c33c055 100644
+--- a/packages/core/src/sync/SyncEngine.ts
++++ b/packages/core/src/sync/SyncEngine.ts
+@@ -265,4 +262,2 @@ export class SyncEngine<Schema extends AnySchema> {
+-		const tx = this.db.makeTupleDbTransaction()
+-		this.pendingWrites.applyPull(tx, { patch, lastMutationId })
+-		tx.commit()
+-		this.cookie = cookie
++		this.db.applyPull(response)
++		if (clientId === this.clientId) this.cookie = cookie
+@@ -272,9 +267,12 @@ export class SyncEngine<Schema extends AnySchema> {
+-		const mutation: Mutation<Schema> = {
+-			ops: transaction.ops,
+-			id: tag<MutationId>(this.mutationCount + 1),
+-		}
+-		this.pendingWrites.commitAndTrack(mutation, {
+-			readCommittedRecord: ({ collection, id }) => this.db.get(collection, id),
+-			commit: () => this.db.commit(transaction),
+-		})
+-		this.mutationCount += 1
++		const clientId = this.clientId
++		// A synchronous subscriber can commit again before this call returns.
++		// Its ID must account for the outbox entry already published by the outer commit.
++		const id = tag<MutationId>(
++			Math.max(
++				this.mutationCount,
++				this.db.outbox.scan({ reverse: true, limit: 1 })[0]?.key[0] ?? 0,
++			) + 1,
++		)
++		this.db.commitMutation(transaction, id)
++		if (clientId === this.clientId)
++			this.mutationCount = Math.max(this.mutationCount, id)
+@@ -286 +284,5 @@ export class SyncEngine<Schema extends AnySchema> {
+-		if (this.pendingWrites.isEmpty) return
++		const mutations = this.db.outbox.scan().map(({ key, value }) => ({
++			id: key[0],
++			ops: value,
++		}))
++		if (!mutations.length) return
+@@ -294 +296 @@ export class SyncEngine<Schema extends AnySchema> {
+-			mutations: this.pendingWrites.snapshot(),
++			mutations,
+@@ -308 +309,0 @@ export class SyncEngine<Schema extends AnySchema> {
+-		this.pendingWrites.clearAll()
+```
+
+```source-diff:transaction2:packages/core/src/transaction/Transaction.ts
+diff --git a/packages/core/src/transaction/Transaction.ts b/packages/core/src/transaction/Transaction.ts
+index 242ca68..2c9cfb6 100644
+--- a/packages/core/src/transaction/Transaction.ts
++++ b/packages/core/src/transaction/Transaction.ts
+@@ -140,5 +167,28 @@ export class Transaction<Schema extends AnySchema> {
+-		/**
+-		 * @internal
+-		 */
+-		readonly tupleDbTx: TupleRootTransactionApi<SchemaToTupleSchema<Schema>>,
+-	) {}
++		tupleDbTx: TupleRootTransactionApi<TandemClientTuple<AnySchema>>,
++	) {
++		this.tupleDbTx = tupleDbTx
++	}
++
++	// tuple-database cannot reduce our generic mapped schema by prefix. Each
++	// subspace fixes the namespace; these assertions restore Schema to its values.
++	// These are views of tupleDbTx, not independent transactions.
++	/** @internal */
++	get records() {
++		return this.tupleDbTx.subspace([
++			"record",
++		]) as unknown as TupleTransactionApi<TupleClientRecord<Schema>>
++	}
++
++	/** @internal */
++	get bases() {
++		return this.tupleDbTx.subspace(["base"]) as unknown as TupleTransactionApi<
++			TupleClientBase<Schema>
++		>
++	}
++
++	/** @internal */
++	get outbox() {
++		return this.tupleDbTx.subspace([
++			"outbox",
++		]) as unknown as TupleTransactionApi<TupleClientOutbox<Schema>>
++	}
+```
+
+```source-diff:storage2:packages/core/src/clientStorage/TandemClientStorage.ts
+diff --git a/packages/core/src/clientStorage/TandemClientStorage.ts b/packages/core/src/clientStorage/TandemClientStorage.ts
+index d95a36b..fd953be 100644
+--- a/packages/core/src/clientStorage/TandemClientStorage.ts
++++ b/packages/core/src/clientStorage/TandemClientStorage.ts
+@@ -2 +2,6 @@ import type { KeyValuePair, ScanStorageArgs, WriteOps } from "tuple-database"
+-import type { AnySchema, SchemaToTupleSchema } from "../schema/Schema.js"
++import type {
++	AnySchema,
++	CollectionIdTuple,
++	CollectionName,
++	SchemaToTupleSchema,
++} from "../schema/Schema.js"
+@@ -6,0 +12,5 @@ import { isEqual } from "../utils/objectUtils.js"
++export type TandemClientBase<Record> = {
++	server: { type: "set"; value: Record } | { type: "remove" }
++	lastWrittenBy: MutationId
++}
++
+@@ -9,0 +20,10 @@ export type TandemClientTuple<Schema extends AnySchema> =
++	| {
++			[Collection in CollectionName<Schema>]: {
++				key: [
++					"base",
++					Collection,
++					...CollectionIdTuple<Schema[Collection]["id"]>,
++				]
++				value: TandemClientBase<Schema[Collection]>
++			}
++	  }[CollectionName<Schema>]
+```
+
+```source-diff:indexeddb2:packages/core/src/clientStorage/TandemClientIndexedDbStorage.ts
+diff --git a/packages/core/src/clientStorage/TandemClientIndexedDbStorage.ts b/packages/core/src/clientStorage/TandemClientIndexedDbStorage.ts
+index dec4c5f..0f29c9c 100644
+--- a/packages/core/src/clientStorage/TandemClientIndexedDbStorage.ts
++++ b/packages/core/src/clientStorage/TandemClientIndexedDbStorage.ts
+@@ -8,0 +9 @@ import type {
++	TandemClientBase,
+@@ -74,0 +76,21 @@ function createTupleCodec<Schema extends AnySchema>(
++			case "base": {
++				const base = tuple.value as TandemClientBase<Schema[keyof Schema]>
++				switch (base.server.type) {
++					case "set": {
++						const valueCodec = codecs[tuple.key[1]]
++						return valueCodec
++							? {
++									...base,
++									server: {
++										type: "set",
++										value: valueCodec[direction](base.server.value),
++									},
++								}
++							: base
++					}
++					case "remove":
++						return base
++					default:
++						return unreachable(base.server)
++				}
++			}
+```
 
 
 ```source-diff:storage:packages/core/src/clientStorage/TandemClientStorage.ts

@@ -26,6 +26,17 @@ new TandemClient<AppSchema, {}>({ clientStorage: otherStorage })
 void appStorage.commit({
 	set: [
 		{
+			key: ["base", "users", "user"],
+			value: {
+				server: { type: "set", value: { id: "user", name: "Ada" } },
+				lastWrittenBy: tag<MutationId>(2),
+			},
+		},
+		{
+			key: ["base", "users", "absent"],
+			value: { server: { type: "remove" }, lastWrittenBy: tag<MutationId>(2) },
+		},
+		{
 			key: ["replica"],
 			value: {
 				clientId: tag<ClientId>("client"),
@@ -59,6 +70,25 @@ void appStorage.commit({
 					value: { id: "user", name: "Ada" },
 				},
 			],
+		},
+	],
+})
+
+void appStorage.commit({
+	set: [
+		{
+			key: ["base", "users", "user"],
+			value: {
+				server: {
+					type: "set",
+					value: {
+						id: "user",
+						// @ts-expect-error Base set values must match their application's record schema.
+						title: "Wrong collection record",
+					},
+				},
+				lastWrittenBy: tag<MutationId>(3),
+			},
 		},
 	],
 })

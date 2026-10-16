@@ -77,6 +77,127 @@ const conflictTest = test.extend<{
 
 describe("TandemClient sync conflicts", () => {
 	conflictTest(
+		"pull writes invalidate drafts even when replay preserves the optimistic record",
+		async ({ makeTodoGatekeeper, server }) => {
+			const remote: RemoteApi<TestsSchema> = {
+				connect: (client) =>
+					server.connect({ ...client, poke: async () => {} }),
+				pull: (args) => server.pull(args),
+				push: (args) => server.push(args),
+			}
+			const gatekeeper = await makeTodoGatekeeper({ remote })
+			const { client1 } = gatekeeper
+			client1.subscribe({ collection: "todos" })
+			const seedTx = server.transact()
+			seedTx.set("todos", todo("shared", { text: "Original" }))
+			await server.commit(seedTx)
+			await (
+				await client1.pullFromRemote()
+			).result
+
+			const pendingTx = client1.transact()
+			pendingTx.set("todos", todo("shared", { text: "Pending" }))
+			await gatekeeper.activateGates()
+			const pending = await client1.commit(pendingTx)
+			await pending.fail(new Error("Lost request"))
+			await expect(pending.result).rejects.toThrow("Lost request")
+			await gatekeeper.deactivateGatesAndSettle()
+
+			// A pull conflicts with the draft even when replay preserves the value it read.
+			const draftTx = client1.transact()
+			draftTx.update("todos", "shared", (record) => ({
+				...record,
+				priority: 9,
+			}))
+			draftTx.set("todos", todo("ghost", { text: "Rejected draft" }))
+			const remoteTx = server.transact()
+			remoteTx.set(
+				"todos",
+				todo("shared", { text: "New remote base", priority: 3 }),
+			)
+			await server.commit(remoteTx)
+			await (
+				await client1.pullFromRemote()
+			).result
+			expect(client1.query({ collection: "todos" })).toEqual([
+				todo("shared", { text: "Pending" }),
+			])
+			expect(() => client1.commit(draftTx)).toThrow("ReadWriteConflictError")
+			expect(client1.query({ collection: "todos" })).toEqual([
+				todo("shared", { text: "Pending" }),
+			])
+
+			// A fresh transaction sends both pending edits without a ghost write or mutation-ID gap.
+			const retryTx = client1.transact()
+			retryTx.update("todos", "shared", (record) => ({
+				...record,
+				priority: 9,
+			}))
+			await (
+				await client1.commit(retryTx)
+			).result
+			await (
+				await client1.pullFromRemote()
+			).result
+
+			const expected = [todo("shared", { text: "Pending", priority: 9 })]
+			expect(client1.query({ collection: "todos" })).toEqual(expected)
+			expect(await server.query({ collection: "todos" })).toEqual(expected)
+		},
+	)
+
+	conflictTest(
+		"a rejected draft cannot leave pending writes or consume a mutation ID",
+		async ({ makeTodoGatekeeper, server }) => {
+			const remote: RemoteApi<TestsSchema> = {
+				connect: (client) =>
+					server.connect({ ...client, poke: async () => {} }),
+				pull: (args) => server.pull(args),
+				push: (args) => server.push(args),
+			}
+			const gatekeeper = await makeTodoGatekeeper({ remote })
+			const { client1 } = gatekeeper
+			client1.subscribe({ collection: "todos" })
+			const seedTx = server.transact()
+			seedTx.set("todos", todo("shared"))
+			await server.commit(seedTx)
+			await (
+				await client1.pullFromRemote()
+			).result
+
+			// Another commit invalidates the draft before any pending state is published.
+			const staleTx = client1.transact()
+			staleTx.get("todos", "shared")
+			staleTx.set("todos", todo("shared", { text: "Rejected" }))
+			staleTx.set("todos", todo("ghost"))
+			const winner = todo("shared", { text: "Winner" })
+			const winnerTx = client1.transact()
+			winnerTx.set("todos", winner)
+			await (
+				await client1.commit(winnerTx)
+			).result
+			expect(() => client1.commit(staleTx)).toThrow("ReadWriteConflictError")
+			expect(client1.query({ collection: "todos" })).toEqual([winner])
+
+			// The next valid write must deliver without a gap or a replayed ghost.
+			const next = todo("next", { text: "Valid next write" })
+			const nextTx = client1.transact()
+			nextTx.set("todos", next)
+			await (
+				await client1.commit(nextTx)
+			).result
+			await (
+				await client1.pullFromRemote()
+			).result
+			expect(await server.query({ collection: "todos" })).toEqual([
+				next,
+				winner,
+			])
+			expect(client1.query({ collection: "todos" })).toEqual([next, winner])
+		},
+	)
+
+	conflictTest(
 		"a lost removal response recovers without losing pending writes",
 		async ({ makeTodoGatekeeper, server }) => {
 			let loseResponse = false

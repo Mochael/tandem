@@ -6,6 +6,7 @@ import type { ScanStorageArgs, WriteOps } from "tuple-database"
 import { decodeTuple, encodeTuple } from "tuple-database/helpers/codec.js"
 import type { AnySchema, RuntimeSchemaDefinition } from "../schema/Schema.js"
 import type {
+	TandemClientBase,
 	TandemClientStorageApi,
 	TandemClientTuple,
 } from "./TandemClientStorage.js"
@@ -71,6 +72,27 @@ function createTupleCodec<Schema extends AnySchema>(
 			case "record": {
 				const valueCodec = codecs?.[tuple.key[1]]
 				return valueCodec ? valueCodec[direction](tuple.value) : tuple.value
+			}
+			case "base": {
+				const base = tuple.value as TandemClientBase<Schema[keyof Schema]>
+				switch (base.server.type) {
+					case "set": {
+						const valueCodec = codecs[tuple.key[1]]
+						return valueCodec
+							? {
+									...base,
+									server: {
+										type: "set",
+										value: valueCodec[direction](base.server.value),
+									},
+								}
+							: base
+					}
+					case "remove":
+						return base
+					default:
+						return unreachable(base.server)
+				}
 			}
 			case "replica":
 				return tuple.value

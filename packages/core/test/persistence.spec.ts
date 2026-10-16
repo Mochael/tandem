@@ -104,7 +104,7 @@ function createPersistentSyncGatekeeper({
 }
 
 describe("TandemClient persistence", () => {
-	test("round-trips replica metadata and ordered outbox operations alongside codec-backed records", async ({
+	test("round-trips replica metadata, sparse bases, and ordered outbox operations alongside codec-backed records", async ({
 		makeStorage,
 		rng,
 		logger,
@@ -128,6 +128,17 @@ describe("TandemClient persistence", () => {
 		const tuples: TandemClientTuple<TestsEventSchema>[] = [
 			{ key: ["record", "events", event.id], value: event },
 			{
+				key: ["base", "events", event.id],
+				value: {
+					server: { type: "set", value: event },
+					lastWrittenBy: mutationId,
+				},
+			},
+			{
+				key: ["base", "events", "event-2"],
+				value: { server: { type: "remove" }, lastWrittenBy: mutationId },
+			},
+			{
 				key: ["replica"],
 				value: {
 					clientId: tag<ClientId>("client-a"),
@@ -147,19 +158,24 @@ describe("TandemClient persistence", () => {
 		await storage.commit({ set: tuples })
 		await storage.close()
 
-		// A new adapter restores class instances inside records and outbox operations.
+		// A new adapter restores class instances in bases and outbox operations, and explicit absence.
 		const reopened = makeStorage<TestsEventSchema>({
 			dbName,
 			schema: testsEventRuntimeSchema,
 		})
 		const restored = await reopened.scan()
-		expect(restored).toHaveLength(3)
+		expect(restored).toHaveLength(5)
 		expect(restored).toEqual(expect.arrayContaining(tuples))
 		const outbox = restored.find((tuple) => tuple.key[0] === "outbox")
 		assert(outbox && Array.isArray(outbox.value))
 		const set = outbox.value[1]
 		assert(set?.type === "set")
 		expect(set.value.startAt).toBeInstanceOf(EventStart)
+		const base = restored.find(
+			(tuple) => tuple.key[0] === "base" && tuple.key[2] === event.id,
+		)
+		assert(base && "server" in base.value && base.value.server.type === "set")
+		expect(base.value.server.value.startAt).toBeInstanceOf(EventStart)
 
 		// Until sync hydration is implemented, only application records enter the visible database.
 		await using harness = buildClientGatekeeper(
@@ -173,12 +189,14 @@ describe("TandemClient persistence", () => {
 		await harness.client.ready
 		expect(harness.client.query({ collection: "events" })).toEqual([event])
 
-		// Removing an outbox entry leaves records and metadata untouched.
+		// Removing an outbox entry leaves records, bases, and metadata untouched.
 		await reopened.commit({ remove: [["outbox", mutationId]] })
 		expect(await reopened.scan()).toEqual(
-			expect.arrayContaining(tuples.slice(0, 2)),
+			expect.arrayContaining(
+				tuples.filter((tuple) => tuple.key[0] !== "outbox"),
+			),
 		)
-		expect(await reopened.scan()).toHaveLength(2)
+		expect(await reopened.scan()).toHaveLength(4)
 	})
 
 	test("does not persist a batch prefix when an outbox codec fails", async ({
