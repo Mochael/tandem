@@ -24,7 +24,7 @@ await db.commit(tx);
 1. **Transactions**: Group operations atomically
 2. **Optimistic Updates**: Apply locally first
 3. **Streaming**: Send to server in background
-4. **Replay**: After a pull, pending mutations are replayed on the server's latest values (see `sync/PendingWrites.ts`)
+4. **Replay**: After a pull, `Database.applyPull` restores tracked records from sparse base tuples and replays remaining outbox operations within the same root transaction.
 
 ## Mutation types
 

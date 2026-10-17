@@ -5,11 +5,16 @@ import {
 	defineSchema,
 	type LoggerApi,
 	type RemoteApi,
+	tag,
+	type ClientId,
+	type Cookie,
+	type MutationId,
 	TandemClient,
 	type TandemClientStorageApi,
+	type TandemClientTuple,
 } from "@tanishqkancharla/tandem-core"
 import * as errore from "errore"
-import { describe, expect } from "vitest"
+import { assert, describe, expect } from "vitest"
 import {
 	buildGatekeeperHarness,
 	expectQuery,
@@ -99,6 +104,147 @@ function createPersistentSyncGatekeeper({
 }
 
 describe("TandemClient persistence", () => {
+	test("round-trips replica metadata, sparse bases, and ordered outbox operations alongside codec-backed records", async ({
+		makeStorage,
+		rng,
+		logger,
+	}) => {
+		const dbName = rng.next("replica-tuples")
+		const storage = makeStorage<TestsEventSchema>({
+			dbName,
+			schema: testsEventRuntimeSchema,
+		})
+		const event = {
+			id: "event-1",
+			title: "Confirmed",
+			startAt: new EventStart("2026-05-04T12:00:00.000Z"),
+		}
+		const edited = {
+			...event,
+			title: "Pending",
+			startAt: new EventStart("2026-05-05T16:30:00.000Z"),
+		}
+		const mutationId = tag<MutationId>(8)
+		const tuples: TandemClientTuple<TestsEventSchema>[] = [
+			{ key: ["record", "events", event.id], value: event },
+			{
+				key: ["base", "events", event.id],
+				value: {
+					server: { type: "set", value: event },
+					lastWrittenBy: mutationId,
+				},
+			},
+			{
+				key: ["base", "events", "event-2"],
+				value: { server: { type: "remove" }, lastWrittenBy: mutationId },
+			},
+			{
+				key: ["replica"],
+				value: {
+					clientId: tag<ClientId>("client-a"),
+					lastIssuedMutationId: mutationId,
+					cookie: tag<Cookie>("view-b"),
+				},
+			},
+			{
+				key: ["outbox", mutationId],
+				value: [
+					{ type: "remove", collection: "events", id: "event-2" },
+					{ type: "set", collection: "events", value: edited },
+					{ type: "remove", collection: "events", id: event.id },
+				],
+			},
+		]
+		await storage.commit({ set: tuples })
+		await storage.close()
+
+		// A new adapter restores class instances in bases and outbox operations, and explicit absence.
+		const reopened = makeStorage<TestsEventSchema>({
+			dbName,
+			schema: testsEventRuntimeSchema,
+		})
+		const restored = await reopened.scan()
+		expect(restored).toHaveLength(5)
+		expect(restored).toEqual(expect.arrayContaining(tuples))
+		const outbox = restored.find((tuple) => tuple.key[0] === "outbox")
+		assert(outbox && Array.isArray(outbox.value))
+		const set = outbox.value[1]
+		assert(set?.type === "set")
+		expect(set.value.startAt).toBeInstanceOf(EventStart)
+		const base = restored.find(
+			(tuple) => tuple.key[0] === "base" && tuple.key[2] === event.id,
+		)
+		assert(base && "server" in base.value && base.value.server.type === "set")
+		expect(base.value.server.value.startAt).toBeInstanceOf(EventStart)
+
+		// Until sync hydration is implemented, only application records enter the visible database.
+		await using harness = buildClientGatekeeper(
+			new TandemClient<TestsEventSchema>({
+				schema: testsEventRuntimeSchema,
+				clientStorage: reopened,
+				logger,
+				autoConnect: false,
+			}),
+		)
+		await harness.client.ready
+		expect(harness.client.query({ collection: "events" })).toEqual([event])
+
+		// Removing an outbox entry leaves records, bases, and metadata untouched.
+		await reopened.commit({ remove: [["outbox", mutationId]] })
+		expect(await reopened.scan()).toEqual(
+			expect.arrayContaining(
+				tuples.filter((tuple) => tuple.key[0] !== "outbox"),
+			),
+		)
+		expect(await reopened.scan()).toHaveLength(4)
+	})
+
+	test("does not persist a batch prefix when an outbox codec fails", async ({
+		makeStorage,
+		rng,
+	}) => {
+		const storage = makeStorage<TestsEventSchema>({
+			dbName: rng.next("failed-outbox-codec"),
+			codecs: {
+				events: codec(
+					"reject",
+					() => {
+						throw new Error("Cannot encode event")
+					},
+					(value) => value as TestsEvent,
+				),
+			},
+		})
+		await expect(
+			storage.commit({
+				set: [
+					{
+						key: ["replica"],
+						value: {
+							clientId: tag<ClientId>("client-a"),
+							lastIssuedMutationId: tag<MutationId>(1),
+						},
+					},
+					{
+						key: ["outbox", tag<MutationId>(1)],
+						value: [
+							{
+								type: "set",
+								collection: "events",
+								value: {
+									id: "event-1",
+									title: "Rejected",
+									startAt: new EventStart("2026-05-04"),
+								},
+							},
+						],
+					},
+				],
+			}),
+		).rejects.toThrow("Cannot encode event")
+		expect(await storage.scan()).toEqual([])
+	})
+
 	test("reloads persisted records after recreating the app", async ({
 		logger,
 		makeStorage,

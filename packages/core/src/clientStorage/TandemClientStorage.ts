@@ -1,10 +1,48 @@
 import type { KeyValuePair, ScanStorageArgs, WriteOps } from "tuple-database"
-import type { AnySchema, SchemaToTupleSchema } from "../schema/Schema.js"
+import type {
+	AnySchema,
+	CollectionIdTuple,
+	CollectionName,
+	SchemaToTupleSchema,
+} from "../schema/Schema.js"
+import type { ClientId, Cookie } from "../sync/SyncEngine.js"
+import type { Mutation, MutationId } from "../transaction/Transaction.js"
 import { isEqual } from "../utils/objectUtils.js"
 
+export type TandemClientBase<Record> = {
+	server: { type: "set"; value: Record } | { type: "remove" }
+	lastWrittenBy: MutationId
+}
+
+/** Durable replica tuples. Sync hydration and delivery are owned by SyncEngine. */
+export type TandemClientTuple<Schema extends AnySchema> =
+	| SchemaToTupleSchema<Schema>
+	| {
+			[Collection in CollectionName<Schema>]: {
+				key: [
+					"base",
+					Collection,
+					...CollectionIdTuple<Schema[Collection]["id"]>,
+				]
+				value: TandemClientBase<Schema[Collection]>
+			}
+	  }[CollectionName<Schema>]
+	| {
+			key: ["replica"]
+			value: {
+				clientId: ClientId
+				lastIssuedMutationId: MutationId
+				cookie?: Cookie
+			}
+	  }
+	| {
+			key: ["outbox", MutationId]
+			value: Mutation<Schema>["ops"]
+	  }
+
 export interface TandemClientStorageApi<Schema extends AnySchema> {
-	scan(args?: ScanStorageArgs): Promise<SchemaToTupleSchema<Schema>[]>
-	commit(writes: WriteOps<SchemaToTupleSchema<Schema>>): Promise<void>
+	scan(args?: ScanStorageArgs): Promise<TandemClientTuple<Schema>[]>
+	commit(writes: WriteOps<TandemClientTuple<Schema>>): Promise<void>
 	close(): Promise<void>
 	clear(): Promise<void>
 }
@@ -63,7 +101,7 @@ export class TandemClientStorage<Schema extends AnySchema> {
 		private readonly onFailure: (error: unknown) => void,
 	) {}
 
-	async commit(writeOps: WriteOps<SchemaToTupleSchema<Schema>>) {
+	async commit(writeOps: WriteOps<TandemClientTuple<Schema>>) {
 		try {
 			await this.adapter.commit(writeOps)
 		} catch (error) {
@@ -72,7 +110,7 @@ export class TandemClientStorage<Schema extends AnySchema> {
 		}
 	}
 
-	async scan(args?: ScanStorageArgs): Promise<SchemaToTupleSchema<Schema>[]> {
+	async scan(args?: ScanStorageArgs): Promise<TandemClientTuple<Schema>[]> {
 		// TODO: what should we do if this fails?
 		return await this.adapter.scan(args)
 	}
