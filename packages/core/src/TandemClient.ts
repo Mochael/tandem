@@ -193,7 +193,8 @@ export class TandemClient<
 	 * Flush any pending writes to client storage immediately.
 	 */
 	async flushClientStorage(): Promise<void> {
-		await this.db.flushClientStorage()
+		const result = await this.db.flushClientStorage()
+		if (result instanceof Error) throw result
 	}
 
 	/**
@@ -203,7 +204,8 @@ export class TandemClient<
 	async clear() {
 		this.logger.info({ message: "clearing database" })
 
-		if (this.syncEngine) await this.syncEngine.clear()
-		else await this.db.clear()
+		if (this.syncEngine) return this.syncEngine.clear()
+		const result = await this.db.clear()
+		if (result instanceof Error) throw result
 	}
 }

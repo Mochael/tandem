@@ -1,8 +1,5 @@
 import { normalizeTupleBounds } from "tuple-database/helpers/sortedTupleArray.js"
-import {
-	prependPrefixToWriteOps,
-	removePrefixFromWriteOps,
-} from "tuple-database/helpers/subspaceHelpers.js"
+import * as errore from "errore"
 import {
 	InMemoryTupleStorage,
 	type ReadOnlyTupleDatabaseClientApi,
@@ -40,12 +37,17 @@ import {
 	type TupleClientRecord,
 	Transaction,
 } from "./transaction/Transaction.js"
-import type { PullResponse } from "./sync/SyncEngine.js"
+import type { ClientId, PullResponse } from "./sync/SyncEngine.js"
 import type { LoggerApi } from "./utils/Logger.js"
 import type { RngApi } from "./utils/randomId.js"
 import { ThrottleQueue } from "./utils/ThrottleQueue.js"
 import { Timer, type TimerApi } from "./utils/Timer.js"
-import { unreachable } from "./utils/typeUtils.js"
+import { tag, unreachable } from "./utils/typeUtils.js"
+
+class ClientStorageError extends errore.createTaggedError({
+	name: "ClientStorageError",
+	message: "Client storage $operation failed",
+}) {}
 
 function mutationOpToRecordKey<Schema extends AnySchema>(
 	op: MutationOp<Schema>,
@@ -101,7 +103,9 @@ export class Database<
 	private readonly rng: RngApi
 	readonly schema?: RuntimeSchemaDefinition<Schema>
 	readonly relations?: Relations
-	private clientStorageWriteQueue?: ThrottleQueue
+	private readonly clientStorageWriteQueue?: ThrottleQueue<void | ClientStorageError>
+	private storageWrites: WriteOps<TandemClientTuple<AnySchema>> = {}
+	private storageClearQueued = false
 	readonly ready: Promise<void>
 
 	// tuple-database cannot reduce namespace filters over our generic mapped schema.
@@ -122,6 +126,22 @@ export class Database<
 		return this.tupleDb.subspace(["outbox"]) as unknown as TupleDatabaseClient<
 			TupleClientOutbox<Schema>
 		>
+	}
+
+	get replica() {
+		// SyncEngine initializes this tuple before accepting synchronized operations.
+		return this.tupleDb.get(["replica"])!
+	}
+
+	initializeReplica(clientId: ClientId) {
+		this.tupleDb.commit({
+			set: [
+				{
+					key: ["replica"],
+					value: { clientId, lastIssuedMutationId: tag<MutationId>(0) },
+				},
+			],
+		})
 	}
 
 	constructor({
@@ -151,80 +171,105 @@ export class Database<
 			typeof clientStorageWriteInterval === "number"
 				? new Timer({ interval: clientStorageWriteInterval })
 				: clientStorageWriteInterval
+		if (this.clientStorage) {
+			this.clientStorageWriteQueue = new ThrottleQueue(
+				() => this.persistStorageBatch(),
+				clientStorageWriteTimer,
+			)
+			this.tupleDb.subscribe({}, (writes) => {
+				this.storageWrites = WriteOpsApi.merge(this.storageWrites, writes)
+				void this.persistClientStorage()?.then(
+					(result) => {
+						if (result instanceof Error)
+							this.logger.error({
+								message: "error committing to storage",
+								error: result,
+							})
+					},
+					(error) =>
+						this.logger.error({
+							message: "error committing to storage",
+							error,
+						}),
+				)
+			})
+		}
 		this.ready = this.clientStorage
-			? this.loadFromStorage({
-					storage: this.clientStorage,
-					timer: clientStorageWriteTimer,
-				})
+			? this.loadFromStorage(this.clientStorage)
 			: Promise.resolve()
 	}
 
-	async clear() {
+	clear(clientId?: ClientId) {
+		// Supersede queued old-session writes; an active batch finishes before the clear batch.
+		this.storageWrites = {}
+		this.storageClearQueued = true
 		const tx = this.tupleDb.transact(this.rng.randomId())
 		for (const { key } of tx.scan({})) tx.remove(key)
+		if (clientId)
+			tx.set(["replica"], {
+				clientId,
+				lastIssuedMutationId: tag<MutationId>(0),
+			})
 		tx.commit()
-
-		// Clear storage if available
-		await this.clientStorage?.clear()
+		return this.flushClientStorage()
 	}
 
 	/**
 	 * What if values in storage changes?
 	 * What if storage too big to load all at once?
 	 */
-	private async loadFromStorage({
-		storage,
-		timer,
-	}: {
-		storage: TandemClientStorage<Schema>
-		timer: TimerApi
-	}) {
+	private async loadFromStorage(storage: TandemClientStorage<Schema>) {
 		this.logger.info({ message: "loading from storage" })
 		const records = await storage.scan(
 			normalizeTupleBounds({ prefix: ["record"] }),
 		)
-		// The scan selects record tuples; remove their namespace for the subspace.
-		// The library's prefix helper preserves values but erases their tuple types.
-		this.records.commit(
-			removePrefixFromWriteOps(["record"], { set: records }) as WriteOps<
-				TupleClientRecord<Schema>
-			>,
-		)
+		// Restore Schema-specific storage values into the namespace-wide root view.
+		this.tupleDb.commit({ set: records as TandemClientTuple<AnySchema>[] })
+	}
 
-		let writeOpsQueue: WriteOps<TupleClientRecord<Schema>> = {}
-
-		const clientStorageWriteQueue = new ThrottleQueue(async () => {
-			this.logger.info({ message: "committing to storage" })
-			const copy = writeOpsQueue
-			writeOpsQueue = {}
-			try {
-				// Subspace subscriptions return relative keys. Restore the record prefix
-				// at the storage boundary; the library's prefix helper erases tuple types.
-				await storage.commit(
-					prependPrefixToWriteOps(["record"], copy) as WriteOps<
-						SchemaToTupleSchema<Schema>
-					>,
+	private async persistStorageBatch() {
+		const writes = this.storageWrites
+		const clear = this.storageClearQueued
+		this.storageWrites = {}
+		this.storageClearQueued = false
+		await this.ready
+		const result = await (async () => {
+			if (clear) {
+				const cleared = await this.clientStorage!.clear().catch(
+					(cause) => new ClientStorageError({ operation: "clear", cause }),
 				)
-				this.logger.info({ message: "committed to storage" })
-			} catch (error) {
-				this.logger.error({ message: "error committing to storage", error })
-				writeOpsQueue = copy
+				if (cleared instanceof Error) return cleared
 			}
-		}, timer)
+			if (!writes.set?.length && !writes.remove?.length) return
+			// The root spans all namespaces; storage restores the configured schema at its boundary.
+			return this.clientStorage!.commit(
+				writes as WriteOps<TandemClientTuple<Schema>>,
+			).catch((cause) => new ClientStorageError({ operation: "commit", cause }))
+		})()
+		if (result instanceof Error && !this.storageClearQueued) {
+			this.storageWrites = WriteOpsApi.merge(writes, this.storageWrites)
+			this.storageClearQueued = clear
+		}
+		return result
+	}
 
-		this.clientStorageWriteQueue = clientStorageWriteQueue
-
-		this.records.subscribe({}, (writeOps) => {
-			writeOpsQueue = WriteOpsApi.merge(writeOpsQueue, writeOps)
-			void clientStorageWriteQueue.enqueue()
-		})
+	persistClientStorage() {
+		if (
+			!this.storageClearQueued &&
+			!this.storageWrites.set?.length &&
+			!this.storageWrites.remove?.length
+		)
+			return this.clientStorageWriteQueue?.flush()
+		return this.clientStorageWriteQueue?.enqueue()
 	}
 
 	/**
 	 * Flush any pending writes to storage immediately.
 	 */
-	async flushClientStorage(): Promise<void> {
-		await this.clientStorageWriteQueue?.flush()
+	async flushClientStorage() {
+		await this.ready
+		void this.persistClientStorage()
+		return this.clientStorageWriteQueue?.flush()
 	}
 
 	transact(): Transaction<Schema> {
@@ -235,8 +280,10 @@ export class Database<
 		transaction.tupleDbTx.commit()
 	}
 
-	commitMutation(transaction: Transaction<Schema>, id: MutationId): void {
+	commitMutation(transaction: Transaction<Schema>): void {
 		const tx = transaction.tupleDbTx
+		const replica = this.replica
+		const id = tag<MutationId>(replica.lastIssuedMutationId + 1)
 		for (const op of transaction.ops) {
 			const recordKey = mutationOpToRecordKey(op)
 			// Pending bookkeeping reads the current checkpoint, not the user's draft read set.
@@ -251,10 +298,11 @@ export class Database<
 			})
 		}
 		transaction.outbox.set([id], [...transaction.ops])
+		tx.set(["replica"], { ...replica, lastIssuedMutationId: id })
 		tx.commit()
 	}
 
-	applyPull({ patch, lastMutationId }: PullResponse<Schema>): void {
+	applyPull({ patch, lastMutationId, cookie }: PullResponse<Schema>): void {
 		const transaction = this.transact()
 		const tx = transaction.tupleDbTx
 		const { records, bases, outbox } = transaction
@@ -291,6 +339,7 @@ export class Database<
 		for (const { key, value } of trackedBases) {
 			if (value.lastWrittenBy <= lastMutationId) bases.remove(key)
 		}
+		tx.set(["replica"], { ...this.replica, cookie })
 		tx.commit()
 	}
 

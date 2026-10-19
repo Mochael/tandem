@@ -28,11 +28,13 @@ const db = new TandemClient({ schema, clientStorage: storage });
 ## Key implementation notes
 
 - Single IndexedDB object store for all data
-- Composite indexes for efficient querying
-- Automatic retry with exponential backoff
-- Graceful fallback to in-memory storage on errors
-- ACID properties maintained through transactions
+- Each adapter commit must apply its whole batch atomically and resolve only after it is durable
+- Serialized batches preserve transaction order; explicit flush waits for queued and active writes
+- Failed batches remain buffered before newer writes; a later commit or explicit flush can retry them
+- Storage failure rejects the waiting public operation; there is no automatic backoff or in-memory fallback
 
 IndexedDB applies collection codecs to record values and to nested `set` values in bases and outbox operations. Metadata and `remove` markers pass through unchanged. Encoding completes before opening the write transaction, so a codec failure cannot persist a prefix of the batch.
 
-`Database` commits records, bases, and the outbox together in memory. It still loads and persists only the `record` subspace. `SyncEngine` does not yet store or hydrate replica metadata. Persisting complete checkpoints and restoring them before connection are subsequent work; the current implementation does not provide durable offline writes.
+`Database` commits records, bases, outbox entries, and replica metadata together in memory, then persists root tuple writes through the same storage API. Pushes wait for their complete mutation snapshot to reach storage. Pull checkpoints include the patch, acknowledgement pruning, and cookie. Clear runs after active saves and supersedes queued old-session writes.
+
+Startup still loads only the `record` subspace and initializes a fresh identity. Restoring all checkpoint namespaces and replaying durable offline writes after restart remain phase 4; complete checkpoint persistence alone does not provide restart recovery.

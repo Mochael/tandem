@@ -118,29 +118,23 @@ export type SyncEngineArgs<Schema extends AnySchema> = {
 
 export class SyncEngine<Schema extends AnySchema> {
 	private syncQueue: TaskQueue<"pull" | "push">
-	private mutationCount = 0
-	private readonly db: Pick<
-		Database<Schema>,
-		"outbox" | "commitMutation" | "applyPull" | "clear"
-	>
+	private readonly db: Database<Schema>
 	private readonly remote: RemoteApi<Schema>
 	private readonly logger: LoggerApi
 	private readonly rng: RngApi
 
-	private currentClientId: ClientId
-	private cookie?: Cookie
 	private disconnectFromRemote?: AsyncUnsubscribe
 	private scanWindow: ScanWindow<Schema> = []
 
 	get clientId(): ClientId {
-		return this.currentClientId
+		return this.db.replica.clientId
 	}
 
 	constructor(args: SyncEngineArgs<Schema>) {
 		this.logger = args.logger
 		this.remote = args.remote
 		this.db = args.db
-		this.currentClientId = args.clientId
+		this.db.initializeReplica(args.clientId)
 		this.rng = args.rng ?? { randomId }
 		const timer =
 			typeof args.syncInterval === "number"
@@ -182,6 +176,9 @@ export class SyncEngine<Schema extends AnySchema> {
 	private async connectToRemote() {
 		this.logger.info({ message: "connecting to remote" })
 		const clientId = this.clientId
+		const checkpoint = await this.db.persistClientStorage()
+		if (checkpoint instanceof Error) return checkpoint
+		if (clientId !== this.clientId) return
 		const unsubscribe = await this.remote.connect({
 			clientId,
 			poke: () => {
@@ -242,7 +239,7 @@ export class SyncEngine<Schema extends AnySchema> {
 		const clientId = this.clientId
 		const response = await this.remote.pull({
 			clientId,
-			cookie: this.cookie,
+			cookie: this.db.replica.cookie,
 			scanWindow: this.scanWindow,
 		})
 		// A response from before clear() must not acknowledge the new session.
@@ -260,33 +257,34 @@ export class SyncEngine<Schema extends AnySchema> {
 		})
 
 		this.db.applyPull(response)
-		if (clientId === this.clientId) this.cookie = cookie
+		return this.db.persistClientStorage()
 	}
 
 	commit(transaction: Transaction<Schema>): Promise<void> {
 		const clientId = this.clientId
-		// A synchronous subscriber can commit again before this call returns.
-		// Its ID must account for the outbox entry already published by the outer commit.
-		const id = tag<MutationId>(
-			Math.max(
-				this.mutationCount,
-				this.db.outbox.scan({ reverse: true, limit: 1 })[0]?.key[0] ?? 0,
-			) + 1,
-		)
-		this.db.commitMutation(transaction, id)
-		if (clientId === this.clientId)
-			this.mutationCount = Math.max(this.mutationCount, id)
-		this.logger.info({ message: "queueing push" })
-		return this.syncQueue.enqueue("push")
+		this.db.commitMutation(transaction)
+		const pendingCheckpoint = this.db.persistClientStorage()
+		if (!pendingCheckpoint) return this.syncQueue.enqueue("push")
+		return pendingCheckpoint.then((checkpoint) => {
+			if (checkpoint instanceof Error) throw checkpoint
+			if (clientId !== this.clientId) return
+			this.logger.info({ message: "queueing push" })
+			return this.syncQueue.enqueue("push")
+		})
 	}
 
 	private async push() {
+		const clientId = this.clientId
 		const mutations = this.db.outbox.scan().map(({ key, value }) => ({
 			id: key[0],
 			ops: value,
 		}))
 		if (!mutations.length) return
 
+		// A queued push can capture mutations newer than the commit that requested it.
+		const checkpoint = await this.db.flushClientStorage()
+		if (checkpoint instanceof Error) return checkpoint
+		if (clientId !== this.clientId) return
 		if (!this.disconnectFromRemote) {
 			this.logger.info({ message: "skipping push while disconnected" })
 			return
@@ -294,7 +292,7 @@ export class SyncEngine<Schema extends AnySchema> {
 
 		const response = await this.remote.push({
 			mutations,
-			clientId: this.clientId,
+			clientId,
 		})
 		if ("error" in response) {
 			return new RemoteResponseError({ operation: "push", cause: response })
@@ -304,10 +302,11 @@ export class SyncEngine<Schema extends AnySchema> {
 	async clear() {
 		const unsubscribe = this.disconnectFromRemote
 		this.disconnectFromRemote = undefined
-		this.currentClientId = tag<ClientId>(this.rng.randomId())
-		this.mutationCount = 0
-		this.cookie = undefined
-		await Promise.all([this.db.clear(), unsubscribe?.()])
+		const [checkpoint] = await Promise.all([
+			this.db.clear(tag<ClientId>(this.rng.randomId())),
+			unsubscribe?.(),
+		])
+		if (checkpoint instanceof Error) throw checkpoint
 		// Preserve connection state, but leave the database empty until a later pull.
 		if (!unsubscribe) return
 		const connected = await this.connectToRemote()

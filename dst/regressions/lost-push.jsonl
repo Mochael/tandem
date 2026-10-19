@@ -1,7 +1,14 @@
-{"kind":"header","format":1,"options":{"seed":2,"steps":10,"faultRate":0.1}}
+{"kind":"header","format":1,"options":{"seed":2,"steps":12,"faultRate":0.1}}
 {"kind":"event","type":"remove","client":"client2","id":"item-1","step":0,"mutationId":1}
 {"kind":"event","type":"advance","step":1,"call":"client2.commit#1","sentBy":"client2Timer","waitingFor":"client2"}
-{"kind":"event","type":"advance","step":2,"call":"client2.commit#1","sentBy":"client2","waitingFor":"server"}
-{"kind":"event","type":"set","client":"client1","item":{"id":"item-3","text":"Note item-3 (rev 3)","done":true,"priority":1},"step":3,"mutationId":1}
-{"kind":"event","type":"advance","step":4,"call":"client1.commit#1","sentBy":"client1Timer","waitingFor":"client1"}
-{"kind":"event","type":"drop","step":5,"fault":"requestLost","call":"client1.commit#1","sentBy":"client1","waitingFor":"server"}
+{"kind":"event","type":"advance","step":2,"call":"client2.commit#1","sentBy":"client2","waitingFor":"client2Storage"}
+{"kind":"event","type":"advance","step":3,"call":"client2.commit#1","sentBy":"client2Storage","waitingFor":"client2"}
+{"kind":"event","type":"advance","step":4,"call":"client2.commit#1","sentBy":"client2Timer","waitingFor":"client2"}
+{"kind":"event","type":"advance","step":5,"call":"client2.commit#1","sentBy":"client2","waitingFor":"server"}
+{"kind":"event","type":"set","client":"client1","item":{"id":"item-3","text":"Note item-3 (rev 3)","done":true,"priority":1},"step":6,"mutationId":1}
+{"kind":"event","type":"advance","step":7,"call":"client1.commit#1","sentBy":"client1Timer","waitingFor":"client1"}
+{"kind":"event","type":"advance","step":8,"call":"client1.commit#1","sentBy":"client1","waitingFor":"client1Storage"}
+{"kind":"event","type":"advance","step":9,"call":"client1.commit#1","sentBy":"client1Storage","waitingFor":"client1"}
+{"kind":"event","type":"advance","step":10,"call":"client1.commit#1","sentBy":"client1Timer","waitingFor":"client1"}
+{"kind":"event","type":"drop","step":11,"fault":"requestLost","call":"client1.commit#1","sentBy":"client1","waitingFor":"server"}
+{"kind":"outcome","stepsCompleted":12,"states":{"server":[{"id":"item-3","text":"Note item-3 (rev 3)","done":true,"priority":1}],"client1":[{"id":"item-3","text":"Note item-3 (rev 3)","done":true,"priority":1}],"client2":[{"id":"item-3","text":"Note item-3 (rev 3)","done":true,"priority":1}]},"clientIds":["client1.0-t5xshe","client2.0-c092i5"]}

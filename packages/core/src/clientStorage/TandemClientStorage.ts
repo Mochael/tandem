@@ -42,6 +42,7 @@ export type TandemClientTuple<Schema extends AnySchema> =
 
 export interface TandemClientStorageApi<Schema extends AnySchema> {
 	scan(args?: ScanStorageArgs): Promise<TandemClientTuple<Schema>[]>
+	/** Apply the whole batch atomically; resolve only after it is durable. */
 	commit(writes: WriteOps<TandemClientTuple<Schema>>): Promise<void>
 	close(): Promise<void>
 	clear(): Promise<void>

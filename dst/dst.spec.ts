@@ -11,6 +11,7 @@ import {
 	replay,
 } from "./DstReplay.js"
 import { DstSimulation } from "./DstSimulation.js"
+import { DstWorld } from "./DstWorld.js"
 
 describe("Deterministic simulation testing", () => {
 	it("converges to the server with interleaved calls and no faults", async () => {
@@ -22,22 +23,40 @@ describe("Deterministic simulation testing", () => {
 	})
 
 	it("settles a final lost request by reconnecting and delivering retained writes", async () => {
-		const result = await new DstSimulation({
-			seed: 2,
-			steps: 6,
-			faultRate: 0.1,
-		}).execute()
-		expect(result.trace.at(-1)).toMatchObject({
+		await using world = await DstWorld.start(2)
+		const item = {
+			id: "item-3",
+			text: "Retained write",
+			done: true,
+			priority: 1,
+		}
+		await world.apply(0, { type: "set", client: "client1", item })
+		await world.settle()
+
+		// Finish local checkpointing and stop at the first outbound push.
+		let step = 1
+		while (
+			world.pending().find(({ name }) => name === "client1.commit#1")
+				?.waitingFor !== "server"
+		) {
+			await world.apply(step++, { type: "advance", call: "client1.commit#1" })
+			await world.settle()
+		}
+		const dropped = await world.apply(step, {
+			type: "drop",
+			call: "client1.commit#1",
+		})
+		expect(dropped).toMatchObject({
 			type: "drop",
 			fault: "requestLost",
 		})
+
+		// Healthy reconnection delivers the retained write, not just an empty converged view.
+		const result = await world.finish()
 		expect(result.violation).toBeUndefined()
-		expect(result.states.server).toEqual([
-			{ id: "item-3", text: "Note item-3 (rev 3)", done: true, priority: 1 },
-		])
+		expect(result.states.server).toEqual([item])
 		expect(result.states.client1).toEqual(result.states.server)
 		expect(result.states.client2).toEqual(result.states.server)
-		expect(result.stepsCompleted).toBe(6)
 	})
 
 	it("restarts crashed clients from their storage and converges", async () => {
@@ -135,7 +154,7 @@ describe("Deterministic simulation testing", () => {
 		expect(readdirSync(outDir)).toEqual([])
 	})
 
-	it("replays the original lost-push trace without a convergence violation", async () => {
+	it("replays the lost-push trace through checkpointing without a convergence violation", async () => {
 		const artifact = parseArtifact(
 			readFileSync(
 				new URL("./regressions/lost-push.jsonl", import.meta.url),
@@ -143,7 +162,7 @@ describe("Deterministic simulation testing", () => {
 			),
 		)
 		expect(await replay(artifact)).toEqual({
-			stepsCompleted: 6,
+			stepsCompleted: 12,
 			violation: undefined,
 			divergence: undefined,
 		})
@@ -157,7 +176,7 @@ describe("Deterministic simulation testing", () => {
 			),
 		)
 		expect(await replay(artifact)).toEqual({
-			stepsCompleted: 15,
+			stepsCompleted: 6,
 			violation: undefined,
 			divergence: undefined,
 		})

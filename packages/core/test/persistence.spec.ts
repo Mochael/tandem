@@ -103,7 +103,342 @@ function createPersistentSyncGatekeeper({
 	return { clients, gatekeeper }
 }
 
+function createCheckpointGatekeeper({
+	storage,
+	server,
+	logger,
+	rng,
+}: {
+	storage: TandemClientStorageApi<TestsSchema>
+	server: RemoteApi<TestsSchema>
+	logger: LoggerApi
+	rng: DemoRng
+}) {
+	return new Gatekeeper()
+		.add("storage", () => storage)
+		.add("server", () => ({
+			connect: (client: Parameters<RemoteApi<TestsSchema>["connect"]>[0]) =>
+				server.connect({ ...client, poke: async () => {} }),
+			pull: (args: Parameters<RemoteApi<TestsSchema>["pull"]>[0]) =>
+				server.pull(args),
+			push: (args: Parameters<RemoteApi<TestsSchema>["push"]>[0]) =>
+				server.push(args),
+		}))
+		.add("syncTimer", () => ({ waitForNextTick: () => Promise.resolve() }), {
+			gates: { enter: false, exit: true },
+		})
+		.add(
+			"client",
+			({ storage, server, syncTimer }) =>
+				new TandemClient<TestsSchema>({
+					clientStorage: storage,
+					clientStorageWriteInterval: 0,
+					remote: server,
+					syncInterval: syncTimer,
+					autoConnect: false,
+					logger,
+					rng: rng.create("checkpoint-client"),
+				}),
+		)
+		.build()
+}
+
+const checkpointTest = test.extend<{
+	checkpoint: ReturnType<typeof createCheckpointGatekeeper>
+	checkpointStorage: TandemClientStorageApi<TestsSchema>
+}>({
+	checkpointStorage: async ({ makeStorage }, use) => {
+		await use(makeStorage<TestsSchema>())
+	},
+	checkpoint: async ({ checkpointStorage, server, logger, rng }, use) => {
+		await using harness = createCheckpointGatekeeper({
+			storage: checkpointStorage,
+			server,
+			logger,
+			rng,
+		})
+		await harness.client.ready
+		await (
+			await harness.client.connect()
+		).result
+		harness.client.subscribe({ collection: "todos" })
+		await (
+			await harness.client.pullFromRemote()
+		).result
+		await use(harness)
+		await harness.deactivateGatesAndSettle()
+		await (
+			await harness.client.disconnect()
+		).result
+		await (
+			await harness.client.flushClientStorage()
+		).result
+	},
+})
+
 describe("TandemClient persistence", () => {
+	checkpointTest(
+		"persists a complete mutation before sending it and checkpoints pull acknowledgements atomically",
+		async ({ checkpoint, checkpointStorage, server }) => {
+			const { client } = checkpoint
+			const record = todo("durable", { text: "Durable before delivery" })
+			const tx = client.transact()
+			tx.set("todos", record)
+			await checkpoint.activateGates()
+			const commit = await client.commit(tx)
+
+			// The edit is optimistic, but the server cannot see it before the checkpoint completes.
+			expect(client.query({ collection: "todos" })).toEqual([record])
+			commit.assertWaitingFor("storage")
+			expect(await server.query({ collection: "todos" })).toEqual([])
+			await commit.continueTo("storage")
+			expect(await checkpointStorage.scan()).toEqual(
+				expect.arrayContaining([
+					{ key: ["record", "todos", record.id], value: record },
+					{
+						key: ["base", "todos", record.id],
+						value: { server: { type: "remove" }, lastWrittenBy: 1 },
+					},
+					{
+						key: ["outbox", 1],
+						value: [{ type: "set", collection: "todos", value: record }],
+					},
+					{
+						key: ["replica"],
+						value: {
+							clientId: client.clientId,
+							lastIssuedMutationId: 1,
+							cookie: expect.anything(),
+						},
+					},
+				]),
+			)
+			await commit.continueToCompletion()
+			expect(await server.query({ collection: "todos" })).toEqual([record])
+
+			// A failed pull checkpoint retains the previous cookie and pending mutation on disk.
+			const authoritative = todo(record.id, {
+				text: "Server corrected",
+				priority: 4,
+			})
+			const serverTx = server.transact()
+			serverTx.set("todos", authoritative)
+			await server.commit(serverTx)
+			const previous = await checkpointStorage.scan()
+			const pull = await client.pullFromRemote()
+			await pull.continueTo("client")
+			await pull.continueTo("server")
+			await pull.continueTo("client")
+			pull.assertWaitingFor("storage")
+			await pull.fail(new Error("Checkpoint unavailable"))
+			await expect(pull.result).rejects.toThrow("Client storage commit failed")
+			expect(await checkpointStorage.scan()).toEqual(previous)
+
+			// An explicit flush retries the entire checkpoint, not acknowledgement pruning alone.
+			const flush = await client.flushClientStorage()
+			await flush.continueToCompletion()
+			const saved = await checkpointStorage.scan()
+			expect(
+				saved.filter(({ key }) => key[0] === "outbox" || key[0] === "base"),
+			).toEqual([])
+			expect(saved).toEqual(
+				expect.arrayContaining([
+					{ key: ["record", "todos", record.id], value: authoritative },
+					{
+						key: ["replica"],
+						value: {
+							clientId: client.clientId,
+							lastIssuedMutationId: 1,
+							cookie: expect.anything(),
+						},
+					},
+				]),
+			)
+			expect(saved.find(({ key }) => key[0] === "replica")).not.toEqual(
+				previous.find(({ key }) => key[0] === "replica"),
+			)
+		},
+	)
+
+	checkpointTest(
+		"retains failed and newer storage batches in order before delivering either mutation",
+		async ({ checkpoint, checkpointStorage, server }) => {
+			const { client } = checkpoint
+			const first = todo("first", { text: "Must not disappear" })
+			const final = todo("first", { text: "Newest version", priority: 7 })
+			const second = todo("second", { text: "Arrived while saving" })
+			const firstTx = client.transact()
+			firstTx.set("todos", first)
+			await checkpoint.activateGates()
+			const failed = await client.commit(firstTx)
+			failed.assertWaitingFor("storage")
+			const nextTx = client.transact()
+			nextTx.remove("todos", first.id)
+			nextTx.set("todos", final)
+			nextTx.set("todos", second)
+			const nextReady = client.commit(nextTx)
+
+			// The second batch must wait; the failed first write must not reach the server.
+			expect(await server.query({ collection: "todos" })).toEqual([])
+			await failed.fail(new Error("Disk temporarily unavailable"))
+			await expect(failed.result).rejects.toThrow(
+				"Client storage commit failed",
+			)
+			const next = await nextReady
+			next.assertWaitingFor("storage")
+			await next.continueTo("storage")
+			const saved = await checkpointStorage.scan()
+			expect(saved).toEqual(
+				expect.arrayContaining([
+					{ key: ["record", "todos", final.id], value: final },
+					{ key: ["record", "todos", second.id], value: second },
+					{
+						key: ["outbox", 1],
+						value: [{ type: "set", collection: "todos", value: first }],
+					},
+					{
+						key: ["outbox", 2],
+						value: [
+							{ type: "remove", collection: "todos", id: first.id },
+							{ type: "set", collection: "todos", value: final },
+							{ type: "set", collection: "todos", value: second },
+						],
+					},
+				]),
+			)
+			await next.continueToCompletion()
+			expect(await server.query({ collection: "todos" })).toEqual([
+				final,
+				second,
+			])
+		},
+	)
+
+	checkpointTest(
+		"waits for newer mutations included in an older queued push",
+		async ({ checkpoint, checkpointStorage, server }) => {
+			const { client } = checkpoint
+			const first = todo("first")
+			const second = todo("second")
+			const firstTx = client.transact()
+			firstTx.set("todos", first)
+			await checkpoint.activateGates()
+			const commit = await client.commit(firstTx)
+			await commit.continueTo("storage")
+			await commit.continueTo("client")
+			commit.assertSentBy("syncTimer")
+			const secondTx = client.transact()
+			secondTx.set("todos", second)
+			const newer = await client.commit(secondTx)
+			newer.assertWaitingFor("storage")
+
+			// Release the older push's timer while the newer mutation is still undurable.
+			const pushing = commit.continueTo("client")
+			expect(await server.query({ collection: "todos" })).toEqual([])
+			expect(
+				(await checkpointStorage.scan()).filter(
+					({ key }) => key[0] === "outbox",
+				),
+			).toHaveLength(1)
+			expect(
+				checkpoint
+					.pendingCalls()
+					.filter(({ waitingFor }) => waitingFor === "server"),
+			).toEqual([])
+			await newer.continueTo("storage")
+			const finishingNewer = newer.continueToCompletion()
+			await pushing
+			await commit.continueToCompletion()
+			await finishingNewer
+			expect(await server.query({ collection: "todos" })).toEqual([
+				first,
+				second,
+			])
+		},
+	)
+
+	checkpointTest(
+		"flush waits for an active checkpoint and reports its failure",
+		async ({ checkpoint, checkpointStorage, server }) => {
+			const { client } = checkpoint
+			const record = todo("flushed")
+			const tx = client.transact()
+			tx.set("todos", record)
+			await checkpoint.activateGates()
+			const commit = await client.commit(tx)
+			commit.assertWaitingFor("storage")
+			let flushed = false
+			const flushReady = client.flushClientStorage().then((call) => {
+				flushed = true
+				return call
+			})
+			await checkpointStorage.scan()
+			expect(flushed).toBe(false)
+
+			// Both public callers see the storage error, and no network mutation escaped.
+			await commit.fail(new Error("Storage failed during flush"))
+			await expect(commit.result).rejects.toThrow(
+				"Client storage commit failed",
+			)
+			const flush = await flushReady
+			await expect(flush.result).rejects.toThrow("Client storage commit failed")
+			expect(await server.query({ collection: "todos" })).toEqual([])
+
+			// Retrying the flush saves the pending write without silently delivering it.
+			const retry = await client.flushClientStorage()
+			await retry.continueToCompletion()
+			expect(await checkpointStorage.scan()).toContainEqual({
+				key: ["record", "todos", record.id],
+				value: record,
+			})
+			expect(await server.query({ collection: "todos" })).toEqual([])
+		},
+	)
+
+	checkpointTest(
+		"orders clear after an active save and never sends its old-session mutation",
+		async ({ checkpoint, checkpointStorage, server }) => {
+			const { client } = checkpoint
+			const oldClientId = client.clientId
+			const oldTx = client.transact()
+			oldTx.set("todos", todo("discarded"))
+			await checkpoint.activateGates()
+			const old = await client.commit(oldTx)
+			await old.continueTo("storage")
+			await old.continueTo("client")
+			const newerTx = client.transact()
+			newerTx.set("todos", todo("also-discarded"))
+			const newer = await client.commit(newerTx)
+			newer.assertWaitingFor("storage")
+			const pushing = old.continueTo("client")
+			const clearing = client.clear()
+			await newer.continueToCompletion()
+			await pushing
+			await old.continueToCompletion()
+			const clear = await clearing
+			await clear.continueToCompletion()
+
+			// The completed old save cannot resurrect records after clear or use the new identity.
+			expect(client.clientId).not.toBe(oldClientId)
+			expect(client.query({ collection: "todos" })).toEqual([])
+			expect(await server.query({ collection: "todos" })).toEqual([])
+			expect(await checkpointStorage.scan()).toEqual([
+				{
+					key: ["replica"],
+					value: { clientId: client.clientId, lastIssuedMutationId: 0 },
+				},
+			])
+
+			// The new session starts at mutation 1 and can deliver normally.
+			const record = todo("kept")
+			const nextTx = client.transact()
+			nextTx.set("todos", record)
+			const next = await client.commit(nextTx)
+			await next.continueToCompletion()
+			expect(await server.query({ collection: "todos" })).toEqual([record])
+		},
+	)
+
 	test("round-trips replica metadata, sparse bases, and ordered outbox operations alongside codec-backed records", async ({
 		makeStorage,
 		rng,
