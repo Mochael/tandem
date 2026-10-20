@@ -53,7 +53,9 @@ export class TandemClient<
 > {
 	private readonly db: Database<Schema, Relations>
 	/**
-	 * Resolves when initial load from storage completes
+	 * Resolves after restoring the checkpoint and initializing replica metadata.
+	 * With client storage configured, await this before creating transactions
+	 * or using the restored clientId.
 	 */
 	readonly ready: Promise<void>
 
@@ -61,7 +63,10 @@ export class TandemClient<
 	private readonly initialClientId: ClientId
 
 	get clientId(): ClientId {
-		return this.syncEngine?.clientId ?? this.initialClientId
+		// Await ready before using the saved identity; hydration may replace this fallback.
+		return this.db.isReady && this.syncEngine
+			? this.db.replica.clientId
+			: this.initialClientId
 	}
 
 	private readonly syncEngine?: SyncEngine<Schema>
@@ -88,6 +93,7 @@ export class TandemClient<
 			relations,
 			logger: this.logger.scope("db"),
 			clientStorage,
+			initialClientId: remote ? this.initialClientId : undefined,
 			clientStorageWriteInterval,
 			rng: this.rng,
 		})
@@ -96,7 +102,6 @@ export class TandemClient<
 			? new SyncEngine({
 					remote,
 					db: this.db,
-					clientId: this.clientId,
 					autoConnect,
 					logger: this.logger.scope("sync-engine"),
 					rng: this.rng,
@@ -146,6 +151,9 @@ export class TandemClient<
 	}
 
 	transact(): Transaction<Schema> {
+		if (!this.db.isReady) {
+			throw new Error("Await client.ready before creating a transaction")
+		}
 		return this.db.transact()
 	}
 
@@ -193,7 +201,8 @@ export class TandemClient<
 	 * Flush any pending writes to client storage immediately.
 	 */
 	async flushClientStorage(): Promise<void> {
-		await this.db.flushClientStorage()
+		const result = await this.db.flushClientStorage()
+		if (result instanceof Error) throw result
 	}
 
 	/**
@@ -202,8 +211,10 @@ export class TandemClient<
 	 */
 	async clear() {
 		this.logger.info({ message: "clearing database" })
+		if (!this.db.isReady) await this.ready
 
-		if (this.syncEngine) await this.syncEngine.clear()
-		else await this.db.clear()
+		if (this.syncEngine) return this.syncEngine.clear()
+		const result = await this.db.clear()
+		if (result instanceof Error) throw result
 	}
 }

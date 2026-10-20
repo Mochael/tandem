@@ -1,40 +1,45 @@
 import type { TimerApi } from "./Timer.js"
 
-export class ThrottleQueue {
-	private taskPromise: Promise<void> | undefined
+export class ThrottleQueue<Result = void> {
+	private pending?: { promise: Promise<Result>; start: () => void }
+	private tail: Promise<Result | undefined> = Promise.resolve(undefined)
 
 	constructor(
-		private readonly task: () => Promise<void>,
+		private readonly task: () => Promise<Result>,
 		private readonly timer: TimerApi,
 	) {}
 
 	/**
-	 * Returns a shared promise for the currently queued batch.
+	 * Coalesce queued work, but serialize batches requested during an active task.
 	 */
-	enqueue(): Promise<void> {
-		if (this.taskPromise) return this.taskPromise
+	enqueue(): Promise<Result> {
+		if (this.pending) return this.pending.promise
 
-		this.taskPromise = this.timer.waitForNextTick().then((): Promise<void> => {
-			const taskPromise = this.task()
-
-			// If you queue once the task has already started running, it should go into a
-			// new batch.
-			this.taskPromise = undefined
-
-			return taskPromise
+		const immediate = Promise.withResolvers<void>()
+		const delay = Promise.race([
+			this.timer.waitForNextTick(),
+			immediate.promise,
+		])
+		// An unexpected rejection still reaches its callers without poisoning later work.
+		const previous = this.tail.then(
+			() => undefined,
+			() => undefined,
+		)
+		const promise = Promise.all([delay, previous]).then(() => {
+			this.pending = undefined
+			return this.task()
 		})
-
-		return this.taskPromise
+		this.pending = { promise, start: () => immediate.resolve() }
+		this.tail = promise
+		return promise
 	}
 
 	/**
-	 * If a batch is queued, immediately execute it without waiting for the
-	 * throttle delay. No-op when nothing is pending.
+	 * Release the pending delay and await all work queued so far, including an active task.
+	 * The original timer only resolves the same delay; it cannot execute the task twice.
 	 */
-	async flush(): Promise<void> {
-		if (this.taskPromise) {
-			this.taskPromise = undefined
-			await this.task()
-		}
+	flush(): Promise<Result | undefined> {
+		this.pending?.start()
+		return this.tail
 	}
 }
