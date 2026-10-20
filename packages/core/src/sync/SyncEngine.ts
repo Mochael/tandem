@@ -174,33 +174,37 @@ export class SyncEngine<Schema extends AnySchema> {
 	private async connectToRemote() {
 		this.logger.info({ message: "connecting to remote" })
 		if (!this.db.isReady) await this.db.ready
-		const clientId = this.clientId
-		const checkpoint = await this.db.persistClientStorage()
-		if (checkpoint instanceof Error) return checkpoint
-		if (clientId !== this.clientId) return
-		const unsubscribe = await this.remote.connect({
-			clientId,
-			poke: () => {
-				if (clientId !== this.clientId) return Promise.resolve()
-				this.logger.info({ message: "received poke from remote" })
-				return this.queuePull().catch((error) => {
-					this.logger.error({ message: "error pulling from remote", error })
-				})
-			},
-		})
-		if (typeof unsubscribe !== "function") {
-			return new RemoteResponseError({
-				operation: "connect",
-				cause: unsubscribe,
+		// Clear can rotate identity during either await; connect the new durable session instead.
+		for (;;) {
+			const clientId = this.clientId
+			const checkpoint = await this.db.persistClientStorage()
+			if (checkpoint instanceof Error) return checkpoint
+			if (clientId !== this.clientId) continue
+			const unsubscribe = await this.remote.connect({
+				clientId,
+				poke: () => {
+					if (clientId !== this.clientId) return Promise.resolve()
+					this.logger.info({ message: "received poke from remote" })
+					return this.queuePull().catch((error) => {
+						this.logger.error({ message: "error pulling from remote", error })
+					})
+				},
 			})
-		}
-		if (clientId !== this.clientId) {
-			await unsubscribe()
+			if (typeof unsubscribe !== "function") {
+				return new RemoteResponseError({
+					operation: "connect",
+					cause: unsubscribe,
+				})
+			}
+			if (clientId !== this.clientId) {
+				await unsubscribe()
+				continue
+			}
+			this.disconnectFromRemote = unsubscribe
+
+			this.logger.info({ message: "connected to remote" })
 			return
 		}
-		this.disconnectFromRemote = unsubscribe
-
-		this.logger.info({ message: "connected to remote" })
 	}
 
 	async disconnect() {

@@ -193,6 +193,43 @@ const checkpointTest = test.extend<{
 })
 
 describe("TandemClient persistence", () => {
+	test("clear during automatic startup still connects and delivers later writes", async ({
+		makeStorage,
+		server,
+		logger,
+		rng,
+	}) => {
+		await using harness = createCheckpointGatekeeper({
+			storage: makeStorage<TestsSchema>(),
+			server,
+			logger,
+			rng,
+			autoConnect: true,
+		})
+		const { client } = harness
+		await client.ready
+		await (
+			await client.clear()
+		).result
+
+		// No explicit reconnect is needed after clear rotates the pending connection's identity.
+		const record = todo("after-startup-clear", { priority: 8 })
+		const tx = client.transact()
+		tx.set("todos", record)
+		await (
+			await client.commit(tx)
+		).result
+		await expect
+			.poll(() => server.query({ collection: "todos" }))
+			.toEqual([record])
+		await (
+			await client.disconnect()
+		).result
+		await (
+			await client.flushClientStorage()
+		).result
+	})
+
 	test("auto-connect waits for hydration and delivers the restored outbox", async ({
 		makeStorage,
 		server,

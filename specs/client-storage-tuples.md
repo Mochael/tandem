@@ -271,7 +271,9 @@ await push() // Send only mutations still pending, in their original order.
 
 Keep the existing pull-first reconnect order. The server's acknowledgement prunes writes it already accepted; remaining mutations retain their original IDs. Existing server mutation deduplication handles retransmission, and a missing or mismatched cookie still requests a reset. `Database.applyPull` remains the only reconciliation/replay path. A reset retains unacknowledged writes and replays them on the new server base. The storage API and IndexedDB adapter do not change.
 
-Build, type checks, lint, and all 162 tests pass. Seven new consumer tests use real IndexedDB to cover offline sets/removals, ordered operations, identity and counter continuity after an empty acknowledged outbox, lost push replies before and after pull checkpoint completion, automatic and explicit connection during delayed hydration, restored bases outside subscriptions, failed scans, and clear during startup. The offline restart regression fails against phase-3 code because it creates a new identity. The strengthened DST crash regression also fails there because the server loses the durable write; both pass with phase 4.
+Build, type checks, lint, and all 163 tests pass. Eight new consumer tests use real IndexedDB to cover offline sets/removals, ordered operations, identity and counter continuity after an empty acknowledged outbox, lost push replies before and after pull checkpoint completion, automatic and explicit connection during delayed hydration, restored bases outside subscriptions, failed scans, and clear during startup. The offline restart regression fails against phase-3 code because it creates a new identity. The strengthened DST crash regression also fails there because the server loses the durable write; both pass with phase 4.
+
+PR review exposed another startup race: `clear()` can rotate identity while automatic connection is waiting for storage. Returning without connecting looked like success and left later writes local. `SyncEngine.connectToRemote` now repeats the connection attempt for the current durable identity when clear supersedes an attempt [[startupClear:new:177-182]]. If a stale remote connection completes, unsubscribe it before continuing [[startupClear:new:199-202]]. Storage and transport failures still propagate; this is not an automatic network-retry loop. The new public-client regression fails before this fix and passes afterward: await readiness, clear immediately, then commit a record and verify server delivery without explicitly reconnecting.
 
 The DST crash fixture remains the historical trace, but its regression now asserts that the write reaches the server and both clients rather than checking convergence alone. Two 16-run sweeps of 500 steps passed: seeds 2026102200–2026102215 at fault rate 0.15, and seeds 2026102300–2026102315 at fault rate 0.1 and crash rate 0.05. Both reported zero violations, nondeterminism, and errors. There is still no automatic retry/backoff or coordination for multiple active clients sharing one store.
 
@@ -289,6 +291,68 @@ The DST crash fixture remains the historical trace, but its regression now asser
 ## Source patches
 
 Phase 4 patch excerpts come first, followed by phases 3, 2, and 1. Select linked call-stack rows to inspect old or new lines. Excerpts omit context lines so embedded patch indentation does not conflict with Markdown whitespace checks.
+
+```source-diff:startupClear:packages/core/src/sync/SyncEngine.ts
+diff --git a/packages/core/src/sync/SyncEngine.ts b/packages/core/src/sync/SyncEngine.ts
+index d7be100..4e6e1ef 100644
+--- a/packages/core/src/sync/SyncEngine.ts
++++ b/packages/core/src/sync/SyncEngine.ts
+@@ -177,18 +177,15 @@ export class SyncEngine<Schema extends AnySchema> {
+-		const clientId = this.clientId
+-		const checkpoint = await this.db.persistClientStorage()
+-		if (checkpoint instanceof Error) return checkpoint
+-		if (clientId !== this.clientId) return
+-		const unsubscribe = await this.remote.connect({
+-			clientId,
+-			poke: () => {
+-				if (clientId !== this.clientId) return Promise.resolve()
+-				this.logger.info({ message: "received poke from remote" })
+-				return this.queuePull().catch((error) => {
+-					this.logger.error({ message: "error pulling from remote", error })
+-				})
+-			},
+-		})
+-		if (typeof unsubscribe !== "function") {
+-			return new RemoteResponseError({
+-				operation: "connect",
+-				cause: unsubscribe,
++		// Clear can rotate identity during either await; connect the new durable session instead.
++		for (;;) {
++			const clientId = this.clientId
++			const checkpoint = await this.db.persistClientStorage()
++			if (checkpoint instanceof Error) return checkpoint
++			if (clientId !== this.clientId) continue
++			const unsubscribe = await this.remote.connect({
++				clientId,
++				poke: () => {
++					if (clientId !== this.clientId) return Promise.resolve()
++					this.logger.info({ message: "received poke from remote" })
++					return this.queuePull().catch((error) => {
++						this.logger.error({ message: "error pulling from remote", error })
++					})
++				},
+@@ -196,3 +193,13 @@ export class SyncEngine<Schema extends AnySchema> {
+-		}
+-		if (clientId !== this.clientId) {
+-			await unsubscribe()
++			if (typeof unsubscribe !== "function") {
++				return new RemoteResponseError({
++					operation: "connect",
++					cause: unsubscribe,
++				})
++			}
++			if (clientId !== this.clientId) {
++				await unsubscribe()
++				continue
++			}
++			this.disconnectFromRemote = unsubscribe
++
++			this.logger.info({ message: "connected to remote" })
+@@ -201,3 +207,0 @@ export class SyncEngine<Schema extends AnySchema> {
+-		this.disconnectFromRemote = unsubscribe
+-
+-		this.logger.info({ message: "connected to remote" })
+```
 
 ```source-diff:database4:packages/core/src/Database.ts
 diff --git a/packages/core/src/Database.ts b/packages/core/src/Database.ts
