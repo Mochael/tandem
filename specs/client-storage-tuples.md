@@ -1,6 +1,6 @@
 # Client storage tuples
 
-Phases 1 and 2 are merged. Phase 3 is implemented and verified locally on `client-durable-checkpoints`: complete checkpoints reach storage before network delivery. The full-confirmed-replica and `["visible"]` proposal is replaced. Restoring checkpoints and replaying offline writes after restart remain phase 4.
+Phases 1 and 2 are merged. Phases 3 and 4 are implemented and verified on `client-durable-checkpoints`. Complete checkpoints reach storage before delivery, and startup restores the saved session before reconnecting. The full-confirmed-replica and `["visible"]` proposal is replaced.
 
 ## Problem overview
 
@@ -234,7 +234,7 @@ Build, type checks, lint, and all 155 tests pass. New consumer tests exercise re
 
 DST fixtures now include storage handoffs before network delivery; the lost-request check explicitly drops the outbound request rather than relying on a seed's former scheduling. Two 16-run sweeps of 500 steps passed: seeds 2026102000–2026102015 at fault rate 0.15, and seeds 2026102100–2026102115 at fault rate 0.1 and crash rate 0.05. Both reported zero violations, nondeterminism, and errors. These sweeps establish convergence, not phase-4 preservation of offline writes after restart.
 
-### Phase 4: Restore the checkpoint before connecting and replay the outbox
+### ✅ Phase 4: Restore the checkpoint before connecting and resume delivery
 
 **Today**
 
@@ -242,30 +242,44 @@ After phase 3, storage contains complete checkpoints, but `Database.loadFromStor
 
 **Proposed**
 
-Load records, bases, outbox, and replica metadata before accepting synchronized writes or connecting. Restore the saved identity, counter, and cookie rather than overwriting them during `SyncEngine` construction. For a fresh store, initialize and persist replica metadata before its first connection. Resolve `TandemClient.ready` after hydration; both automatic and explicit connection must wait for it.
+Load records, bases, outbox, and replica metadata before accepting transactions or connecting. Restore the saved identity, counter, and cookie rather than overwriting them during `SyncEngine` construction. For a fresh store, initialize and persist replica metadata before its first connection. Resolve `TandemClient.ready` after hydration; both automatic and explicit connection wait for it. This phase is implemented and verified locally.
 
-The saved records already contain optimistic state. To verify that view, restore tracked records from their bases and replay the outbox in order; records without a base remain unchanged. No full confirmed-record scan or second materialized namespace is needed.
+The saved records already contain optimistic state, atomically checkpointed with the bases and outbox. Startup restores that checkpoint directly; it does not rebuild the records or replay mutations again. Install the persistence subscriber after loading so hydration does not enqueue a redundant save. Initialize replica metadata only when the checkpoint has none.
 
 ```callstack
  TandemClient [[packages/core/src/TandemClient.ts#TandemClient]]
-+├── Database.loadFromStorage # load every checkpoint namespace
-+├── restore tracked records and replay the outbox
-+├── resolve ready after hydration
++├── Database.loadFromStorage # load every checkpoint namespace [[database4:new:244-247]] [[database4:new:249]]
++├── initialize replica metadata only for a fresh store [[database4:new:208-211]]
++├── resolve ready after hydration [[database4:new:212-215]]
  └── SyncEngine.connect [[packages/core/src/sync/SyncEngine.ts#SyncEngine.connect]]
-    ├── pull using the restored identity and cookie
-    │  └── checkpoint the acknowledgement or reset
-    └── push remaining durable mutations in ID order
++   ├── await hydration before connecting [[sync4:new:176]]
+    ├── SyncEngine.queuePull # reconcile and checkpoint the server acknowledgement [[packages/core/src/sync/SyncEngine.ts#SyncEngine.queuePull]]
+    └── SyncEngine.push # deliver remaining mutations with their original IDs [[packages/core/src/sync/SyncEngine.ts#SyncEngine.push]]
 ```
 
-Keep the existing pull-first reconnect order. The server's acknowledgement prunes writes it already accepted; remaining mutations retain their original IDs. Existing server mutation deduplication handles retransmission, and a missing or mismatched cookie still requests a reset. A reset must retain unacknowledged writes and replay them on the new server base.
+`transact()` stays synchronous and throws before readiness [[client4:new:154-156]], so a draft cannot read the empty pre-hydration database and overwrite restored data. Clients without storage remain immediately writable. `clear()` waits for hydration before discarding the saved session [[client4:new:214]]. A failed storage scan rejects readiness and connection without replacing the checkpoint. Await `ready` before using the saved `clientId`; the public getter returns the generated fallback while hydration is pending. `Database.replica` checks its initialized-replica invariant once [[database4:new:137-140]], so sync callers do not need non-null assertions. Only initialization performs an optional tuple lookup.
 
-Validate actual restart recovery: recreate a client after a durable offline write, after a lost push response, and around pull checkpoint completion. Assert that pending sets and removals survive, already accepted writes are not applied twice, IDs do not restart at one, and clients converge after calls drain. Extend DST restart coverage to these durable cases; convergence-only sweeps do not establish that unsent offline writes survived a crash.
+```tsx
+await client.ready // Restore records, bases, outbox, identity, counter, and cookie.
+const tx = client.transact() // Throws if created before hydration finishes.
+
+// Existing reconnect order, now using the restored session:
+await remote.connect({ clientId: db.replica.clientId, poke })
+await pull() // Prune accepted IDs, reconcile the patch, and persist the checkpoint.
+await push() // Send only mutations still pending, in their original order.
+```
+
+Keep the existing pull-first reconnect order. The server's acknowledgement prunes writes it already accepted; remaining mutations retain their original IDs. Existing server mutation deduplication handles retransmission, and a missing or mismatched cookie still requests a reset. `Database.applyPull` remains the only reconciliation/replay path. A reset retains unacknowledged writes and replays them on the new server base. The storage API and IndexedDB adapter do not change.
+
+Build, type checks, lint, and all 162 tests pass. Seven new consumer tests use real IndexedDB to cover offline sets/removals, ordered operations, identity and counter continuity after an empty acknowledged outbox, lost push replies before and after pull checkpoint completion, automatic and explicit connection during delayed hydration, restored bases outside subscriptions, failed scans, and clear during startup. The offline restart regression fails against phase-3 code because it creates a new identity. The strengthened DST crash regression also fails there because the server loses the durable write; both pass with phase 4.
+
+The DST crash fixture remains the historical trace, but its regression now asserts that the write reaches the server and both clients rather than checking convergence alone. Two 16-run sweeps of 500 steps passed: seeds 2026102200–2026102215 at fault rate 0.15, and seeds 2026102300–2026102315 at fault rate 0.1 and crash rate 0.05. Both reported zero violations, nondeterminism, and errors. There is still no automatic retry/backoff or coordination for multiple active clients sharing one store.
 
 ## References
 
 - `packages/core/src/clientStorage/TandemClientStorage.ts` — tuple schema and storage contract.
 - `packages/core/src/clientStorage/TandemClientIndexedDbStorage.ts` — codec dispatch and IndexedDB batches.
-- `packages/core/src/Database.ts` — transaction boundary and current record-cache loading.
+- `packages/core/src/Database.ts` — transaction boundary and checkpoint hydration.
 - `packages/core/src/sync/SyncEngine.ts` — delivery, acknowledgements, and connection lifecycle.
 - `packages/core/src/utils/ThrottleQueue.ts` — ordered batching and flush barriers.
 - `packages/core/test/persistence.spec.ts` — mixed-tuple and codec-failure regressions.
@@ -274,7 +288,114 @@ Validate actual restart recovery: recreate a client after a durable offline writ
 
 ## Source patches
 
-Phase 3 patch excerpts come first, followed by phases 2 and 1. Phase 4 has no implementation patches yet. Select linked call-stack rows to inspect old or new lines. Excerpts omit context lines so embedded patch indentation does not conflict with Markdown whitespace checks.
+Phase 4 patch excerpts come first, followed by phases 3, 2, and 1. Select linked call-stack rows to inspect old or new lines. Excerpts omit context lines so embedded patch indentation does not conflict with Markdown whitespace checks.
+
+```source-diff:database4:packages/core/src/Database.ts
+diff --git a/packages/core/src/Database.ts b/packages/core/src/Database.ts
+index c915a6f..a9742dc 100644
+--- a/packages/core/src/Database.ts
++++ b/packages/core/src/Database.ts
+@@ -108,0 +109 @@ export class Database<
++	private initialized = false
+@@ -110,0 +112,4 @@ export class Database<
++	get isReady() {
++		return this.initialized
++	}
++
+@@ -132,2 +137,4 @@ export class Database<
+-		// SyncEngine initializes this tuple before accepting synchronized operations.
+-		return this.tupleDb.get(["replica"])!
++		// Sync operations run only after hydration has restored or initialized this tuple.
++		const replica = this.tupleDb.get(["replica"])
++		if (!replica) throw new Error("Replica is not initialized")
++		return replica
+@@ -179,5 +187,15 @@ export class Database<
+-			this.tupleDb.subscribe({}, (writes) => {
+-				this.storageWrites = WriteOpsApi.merge(this.storageWrites, writes)
+-				void this.persistClientStorage()?.then(
+-					(result) => {
+-						if (result instanceof Error)
++		}
++		const initialize = () => {
++			// Hydration restores an existing checkpoint; do not enqueue it for saving again.
++			if (this.clientStorage)
++				this.tupleDb.subscribe({}, (writes) => {
++					this.storageWrites = WriteOpsApi.merge(this.storageWrites, writes)
++					void this.persistClientStorage()?.then(
++						(result) => {
++							if (result instanceof Error)
++								this.logger.error({
++									message: "error committing to storage",
++									error: result,
++								})
++						},
++						(error) =>
+@@ -186,9 +204,12 @@ export class Database<
+-								error: result,
+-							})
+-					},
+-					(error) =>
+-						this.logger.error({
+-							message: "error committing to storage",
+-							error,
+-						}),
+-				)
++								error,
++							}),
++					)
++				})
++			if (initialClientId && !this.tupleDb.get(["replica"]))
++				this.initializeReplica(initialClientId)
++			this.initialized = true
++		}
++		if (this.clientStorage) {
++			this.ready = this.loadFromStorage(this.clientStorage).then((result) => {
++				if (result instanceof Error) throw result
++				initialize()
+@@ -195,0 +217,3 @@ export class Database<
++		} else {
++			initialize()
++			this.ready = Promise.resolve()
+@@ -197,3 +220,0 @@ export class Database<
+-		this.ready = this.clientStorage
+-			? this.loadFromStorage(this.clientStorage)
+-			: Promise.resolve()
+@@ -223,3 +244,4 @@ export class Database<
+-		const records = await storage.scan(
+-			normalizeTupleBounds({ prefix: ["record"] }),
+-		)
++		const checkpoint = await storage
++			.scan()
++			.catch((cause) => new ClientStorageError({ operation: "scan", cause }))
++		if (checkpoint instanceof Error) return checkpoint
+@@ -227 +249 @@ export class Database<
+-		this.tupleDb.commit({ set: records as TandemClientTuple<AnySchema>[] })
++		this.tupleDb.commit({ set: checkpoint as TandemClientTuple<AnySchema>[] })
+```
+
+```source-diff:client4:packages/core/src/TandemClient.ts
+diff --git a/packages/core/src/TandemClient.ts b/packages/core/src/TandemClient.ts
+index c37b061..b65060c 100644
+--- a/packages/core/src/TandemClient.ts
++++ b/packages/core/src/TandemClient.ts
+@@ -148,0 +154,3 @@ export class TandemClient<
++		if (!this.db.isReady) {
++			throw new Error("Await client.ready before creating a transaction")
++		}
+@@ -205,0 +214 @@ export class TandemClient<
++		if (!this.db.isReady) await this.ready
+```
+
+```source-diff:sync4:packages/core/src/sync/SyncEngine.ts
+diff --git a/packages/core/src/sync/SyncEngine.ts b/packages/core/src/sync/SyncEngine.ts
+index cabd3ef..d7be100 100644
+--- a/packages/core/src/sync/SyncEngine.ts
++++ b/packages/core/src/sync/SyncEngine.ts
+@@ -137 +135,0 @@ export class SyncEngine<Schema extends AnySchema> {
+-		this.db.initializeReplica(args.clientId)
+@@ -177,0 +176 @@ export class SyncEngine<Schema extends AnySchema> {
++		if (!this.db.isReady) await this.db.ready
+```
 
 ```source-diff:database3:packages/core/src/Database.ts
 diff --git a/packages/core/src/Database.ts b/packages/core/src/Database.ts

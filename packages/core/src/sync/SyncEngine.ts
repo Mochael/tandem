@@ -107,7 +107,6 @@ export namespace PatchApi {
 }
 
 export type SyncEngineArgs<Schema extends AnySchema> = {
-	clientId: ClientId
 	remote: SyncEngine<Schema>["remote"]
 	db: SyncEngine<Schema>["db"]
 	autoConnect?: boolean
@@ -134,7 +133,6 @@ export class SyncEngine<Schema extends AnySchema> {
 		this.logger = args.logger
 		this.remote = args.remote
 		this.db = args.db
-		this.db.initializeReplica(args.clientId)
 		this.rng = args.rng ?? { randomId }
 		const timer =
 			typeof args.syncInterval === "number"
@@ -175,6 +173,7 @@ export class SyncEngine<Schema extends AnySchema> {
 
 	private async connectToRemote() {
 		this.logger.info({ message: "connecting to remote" })
+		if (!this.db.isReady) await this.db.ready
 		const clientId = this.clientId
 		const checkpoint = await this.db.persistClientStorage()
 		if (checkpoint instanceof Error) return checkpoint

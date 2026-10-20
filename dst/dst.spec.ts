@@ -168,7 +168,7 @@ describe("Deterministic simulation testing", () => {
 		})
 	})
 
-	it("replays the crash ghost trace and removes stale persisted records", async () => {
+	it("replays the crash trace and delivers the durable optimistic write", async () => {
 		const artifact = parseArtifact(
 			readFileSync(
 				new URL("./regressions/crash-ghost.jsonl", import.meta.url),
@@ -180,6 +180,20 @@ describe("Deterministic simulation testing", () => {
 			violation: undefined,
 			divergence: undefined,
 		})
+
+		// Convergence alone could pass by discarding the write. Check delivery too.
+		await using world = await DstWorld.start(artifact.options.seed)
+		for (const event of artifact.trace) {
+			world.pending()
+			await world.apply(event.step, event)
+			await world.settle()
+		}
+		const result = await world.finish()
+		expect(result.states.server).toEqual([
+			{ id: "item-1", text: "Optimistic ghost", done: false, priority: 5 },
+		])
+		expect(result.states.client1).toEqual(result.states.server)
+		expect(result.states.client2).toEqual(result.states.server)
 	})
 
 	it.each([

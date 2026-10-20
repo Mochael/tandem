@@ -108,11 +108,13 @@ function createCheckpointGatekeeper({
 	server,
 	logger,
 	rng,
+	autoConnect = false,
 }: {
 	storage: TandemClientStorageApi<TestsSchema>
 	server: RemoteApi<TestsSchema>
 	logger: LoggerApi
 	rng: DemoRng
+	autoConnect?: boolean
 }) {
 	return new Gatekeeper()
 		.add("storage", () => storage)
@@ -135,7 +137,7 @@ function createCheckpointGatekeeper({
 					clientStorageWriteInterval: 0,
 					remote: server,
 					syncInterval: syncTimer,
-					autoConnect: false,
+					autoConnect,
 					logger,
 					rng: rng.create("checkpoint-client"),
 				}),
@@ -146,9 +148,23 @@ function createCheckpointGatekeeper({
 const checkpointTest = test.extend<{
 	checkpoint: ReturnType<typeof createCheckpointGatekeeper>
 	checkpointStorage: TandemClientStorageApi<TestsSchema>
+	checkpointScan: { blocked?: PromiseWithResolvers<void>; failure?: Error }
 }>({
-	checkpointStorage: async ({ makeStorage }, use) => {
-		await use(makeStorage<TestsSchema>())
+	checkpointScan: async ({}, use) => {
+		await use({})
+	},
+	checkpointStorage: async ({ makeStorage, checkpointScan }, use) => {
+		const storage = makeStorage<TestsSchema>()
+		await use({
+			scan: async (args) => {
+				await checkpointScan.blocked?.promise
+				if (checkpointScan.failure) throw checkpointScan.failure
+				return storage.scan(args)
+			},
+			commit: (writes) => storage.commit(writes),
+			clear: () => storage.clear(),
+			close: () => storage.close(),
+		})
 	},
 	checkpoint: async ({ checkpointStorage, server, logger, rng }, use) => {
 		await using harness = createCheckpointGatekeeper({
@@ -177,6 +193,314 @@ const checkpointTest = test.extend<{
 })
 
 describe("TandemClient persistence", () => {
+	test("auto-connect waits for hydration and delivers the restored outbox", async ({
+		makeStorage,
+		server,
+		logger,
+		rng,
+	}) => {
+		const storage = makeStorage<TestsSchema>()
+		await using original = createCheckpointGatekeeper({
+			storage,
+			server,
+			logger,
+			rng,
+		})
+		await original.client.ready
+		const record = todo("automatic-recovery", { priority: 6 })
+		const tx = original.client.transact()
+		tx.set("todos", record)
+		await (
+			await original.client.commit(tx)
+		).result
+		const clientId = original.client.clientId
+		await original.crash("client")
+
+		// The next instance starts automatically, but cannot send before the scan completes.
+		const scan = Promise.withResolvers<void>()
+		using cleanup = new errore.DisposableStack()
+		cleanup.defer(() => scan.resolve())
+		await using restarted = createCheckpointGatekeeper({
+			storage: {
+				scan: async (args) => {
+					await scan.promise
+					return storage.scan(args)
+				},
+				commit: (writes) => storage.commit(writes),
+				clear: () => storage.clear(),
+				close: () => storage.close(),
+			},
+			server,
+			logger,
+			rng,
+			autoConnect: true,
+		})
+		expect(await server.query({ collection: "todos" })).toEqual([])
+		scan.resolve()
+		await restarted.client.ready
+		expect(restarted.client.clientId).toBe(clientId)
+		expect(restarted.client.query({ collection: "todos" })).toEqual([record])
+		await expect
+			.poll(() => server.query({ collection: "todos" }))
+			.toEqual([record])
+
+		// Restored bases remove acknowledged optimistic records outside every subscription.
+		await (
+			await restarted.client.pullFromRemote()
+		).result
+		expect(restarted.client.query({ collection: "todos" })).toEqual([])
+		await (
+			await restarted.client.disconnect()
+		).result
+		await (
+			await restarted.client.flushClientStorage()
+		).result
+	})
+
+	checkpointTest(
+		"restores offline sets and removals, preserves identity, and continues mutation IDs after acknowledgement",
+		async ({ checkpoint, server }) => {
+			const { client } = checkpoint
+			const removed = todo("removed")
+			const seedTx = client.transact()
+			seedTx.set("todos", removed)
+			await (
+				await client.commit(seedTx)
+			).result
+			await (
+				await client.pullFromRemote()
+			).result
+			const clientId = client.clientId
+			await (
+				await client.disconnect()
+			).result
+
+			// Persist an offline removal and ordered edits; none have reached the server.
+			const record = todo("offline", { text: "Survives restart", priority: 7 })
+			const offlineTx = client.transact()
+			offlineTx.remove("todos", removed.id)
+			offlineTx.set("todos", todo("temporary"))
+			offlineTx.remove("todos", "temporary")
+			offlineTx.set("todos", record)
+			await (
+				await client.commit(offlineTx)
+			).result
+			expect(await server.query({ collection: "todos" })).toEqual([removed])
+			await checkpoint.crash("client")
+			await checkpoint.restart("client")
+			await client.ready
+			expect(client.clientId).toBe(clientId)
+			expect(client.query({ collection: "todos" })).toEqual([record])
+
+			// Reconnection delivers the durable outbox with its original IDs.
+			client.subscribe({ collection: "todos" })
+			await (
+				await client.connect()
+			).result
+			await (
+				await client.pullFromRemote()
+			).result
+			expect(await server.query({ collection: "todos" })).toEqual([record])
+			expect(client.query({ collection: "todos" })).toEqual([record])
+
+			// An empty acknowledged outbox must not reset the issued-mutation counter.
+			await (
+				await client.disconnect()
+			).result
+			await checkpoint.crash("client")
+			await checkpoint.restart("client")
+			await client.ready
+			client.subscribe({ collection: "todos" })
+			await (
+				await client.connect()
+			).result
+			const next = todo("next")
+			const nextTx = client.transact()
+			nextTx.set("todos", next)
+			await (
+				await client.commit(nextTx)
+			).result
+			expect(await server.query({ collection: "todos" })).toEqual([
+				next,
+				record,
+			])
+		},
+	)
+
+	for (const savePull of [false, true]) {
+		checkpointTest(
+			`restores the checkpoint after a lost push reply with pull saved=${savePull}`,
+			async ({ checkpoint, server }) => {
+				const { client } = checkpoint
+				const clientId = client.clientId
+				const optimistic = todo("accepted", { text: "Optimistic" })
+				const tx = client.transact()
+				tx.set("todos", optimistic)
+				await checkpoint.activateGates()
+				const commit = await client.commit(tx)
+				await commit.continueTo("storage")
+				await commit.continueTo("client")
+				await commit.continueTo("client")
+				await commit.continueTo("server")
+				commit.assertSentBy("server")
+				await commit.fail(new Error("Push reply lost"))
+				await expect(commit.result).rejects.toThrow("Push reply lost")
+
+				// The server already accepted mutation 1, then another writer corrected it.
+				const authoritative = todo(optimistic.id, {
+					text: "Server corrected",
+					priority: 9,
+				})
+				const serverTx = server.transact()
+				serverTx.set("todos", authoritative)
+				await server.commit(serverTx)
+				const pull = await client.pullFromRemote()
+				await pull.continueTo("client")
+				await pull.continueTo("server")
+				await pull.continueTo("client")
+				pull.assertWaitingFor("storage")
+				if (savePull) {
+					await pull.continueToCompletion()
+				} else {
+					await pull.fail(new Error("Pull checkpoint failed"))
+					await expect(pull.result).rejects.toThrow(
+						"Client storage commit failed",
+					)
+				}
+				await checkpoint.crash("client")
+				await checkpoint.deactivateGatesAndSettle()
+				await checkpoint.restart("client")
+				await client.ready
+				expect(client.clientId).toBe(clientId)
+				expect(client.query({ collection: "todos" })).toEqual([
+					savePull ? authoritative : optimistic,
+				])
+
+				// Pull first prunes the accepted mutation; replay must not undo the correction.
+				client.subscribe({ collection: "todos" })
+				await (
+					await client.connect()
+				).result
+				expect(client.query({ collection: "todos" })).toEqual([authoritative])
+				expect(await server.query({ collection: "todos" })).toEqual([
+					authoritative,
+				])
+			},
+		)
+	}
+
+	checkpointTest(
+		"blocks transactions and connection until hydration",
+		async ({ checkpoint, checkpointScan }) => {
+			const { client } = checkpoint
+			await (
+				await client.disconnect()
+			).result
+			await checkpoint.crash("client")
+			const scan = Promise.withResolvers<void>()
+			checkpointScan.blocked = scan
+			using cleanup = new errore.DisposableStack()
+			cleanup.defer(() => scan.resolve())
+			await checkpoint.activateGates()
+			await checkpoint.restart("client")
+			expect(() => client.transact()).toThrow("Await client.ready")
+			const connecting = client.connect()
+			expect(
+				checkpoint
+					.pendingCalls()
+					.filter(({ waitingFor }) => waitingFor === "server"),
+			).toEqual([])
+			scan.resolve()
+			await client.ready
+			const connect = await connecting
+			connect.assertWaitingFor("server")
+			expect(
+				checkpoint
+					.pendingCalls()
+					.filter(({ waitingFor }) => waitingFor === "storage"),
+			).toEqual([])
+			await connect.continueToCompletion()
+		},
+	)
+
+	checkpointTest(
+		"scan failure rejects readiness and connection without replacing the saved checkpoint",
+		async ({ checkpoint, checkpointScan, server }) => {
+			const { client } = checkpoint
+			await (
+				await client.disconnect()
+			).result
+			const record = todo("scan-recovery")
+			const tx = client.transact()
+			tx.set("todos", record)
+			await (
+				await client.commit(tx)
+			).result
+			const clientId = client.clientId
+			await checkpoint.crash("client")
+			checkpointScan.failure = new Error("Scan unavailable")
+			await checkpoint.restart("client")
+			await expect(client.ready).rejects.toThrow("Client storage scan failed")
+			await expect((await client.connect()).result).rejects.toThrow(
+				"Client storage scan failed",
+			)
+			expect(() => client.transact()).toThrow("Await client.ready")
+
+			// A new instance can still recover and deliver the untouched durable write.
+			await checkpoint.crash("client")
+			checkpointScan.failure = undefined
+			await checkpoint.restart("client")
+			await client.ready
+			expect(client.clientId).toBe(clientId)
+			expect(client.query({ collection: "todos" })).toEqual([record])
+			client.subscribe({ collection: "todos" })
+			await (
+				await client.connect()
+			).result
+			expect(await server.query({ collection: "todos" })).toEqual([record])
+		},
+	)
+
+	checkpointTest(
+		"clear waits for hydration and discards the saved outbox",
+		async ({ checkpoint, checkpointScan, server }) => {
+			const { client } = checkpoint
+			await (
+				await client.disconnect()
+			).result
+			const tx = client.transact()
+			tx.set("todos", todo("discarded-on-startup"))
+			await (
+				await client.commit(tx)
+			).result
+			const oldClientId = client.clientId
+			await checkpoint.crash("client")
+			const scan = Promise.withResolvers<void>()
+			checkpointScan.blocked = scan
+			using cleanup = new errore.DisposableStack()
+			cleanup.defer(() => scan.resolve())
+			await checkpoint.activateGates()
+			await checkpoint.restart("client")
+			const clearing = client.clear()
+			scan.resolve()
+			const clear = await clearing
+			await clear.continueToCompletion()
+
+			// A later restart cannot bring discarded writes back or deliver them.
+			await checkpoint.deactivateGatesAndSettle()
+			expect(client.clientId).not.toBe(oldClientId)
+			await checkpoint.crash("client")
+			await checkpoint.restart("client")
+			await client.ready
+			client.subscribe({ collection: "todos" })
+			await (
+				await client.connect()
+			).result
+			expect(client.query({ collection: "todos" })).toEqual([])
+			expect(await server.query({ collection: "todos" })).toEqual([])
+		},
+	)
+
 	checkpointTest(
 		"persists a complete mutation before sending it and checkpoints pull acknowledgements atomically",
 		async ({ checkpoint, checkpointStorage, server }) => {
@@ -512,7 +836,7 @@ describe("TandemClient persistence", () => {
 		assert(base && "server" in base.value && base.value.server.type === "set")
 		expect(base.value.server.value.startAt).toBeInstanceOf(EventStart)
 
-		// Until sync hydration is implemented, only application records enter the visible database.
+		// Hydration exposes only record tuples to application queries.
 		await using harness = buildClientGatekeeper(
 			new TandemClient<TestsEventSchema>({
 				schema: testsEventRuntimeSchema,

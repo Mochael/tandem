@@ -1,4 +1,3 @@
-import { normalizeTupleBounds } from "tuple-database/helpers/sortedTupleArray.js"
 import * as errore from "errore"
 import {
 	InMemoryTupleStorage,
@@ -86,6 +85,7 @@ export type DatabaseArgs<
 	schema?: RuntimeSchemaDefinition<Schema>
 	relations?: Relations
 	clientStorage?: TandemClientStorageApi<Schema>
+	initialClientId?: ClientId
 	clientStorageWriteInterval: number | TimerApi
 	logger: LoggerApi
 	rng: RngApi
@@ -106,7 +106,12 @@ export class Database<
 	private readonly clientStorageWriteQueue?: ThrottleQueue<void | ClientStorageError>
 	private storageWrites: WriteOps<TandemClientTuple<AnySchema>> = {}
 	private storageClearQueued = false
+	private initialized = false
 	readonly ready: Promise<void>
+
+	get isReady() {
+		return this.initialized
+	}
 
 	// tuple-database cannot reduce namespace filters over our generic mapped schema.
 	// The prefix fixes the namespace, so only these views assert its Schema-specific values.
@@ -129,11 +134,13 @@ export class Database<
 	}
 
 	get replica() {
-		// SyncEngine initializes this tuple before accepting synchronized operations.
-		return this.tupleDb.get(["replica"])!
+		// Sync operations run only after hydration has restored or initialized this tuple.
+		const replica = this.tupleDb.get(["replica"])
+		if (!replica) throw new Error("Replica is not initialized")
+		return replica
 	}
 
-	initializeReplica(clientId: ClientId) {
+	private initializeReplica(clientId: ClientId) {
 		this.tupleDb.commit({
 			set: [
 				{
@@ -149,6 +156,7 @@ export class Database<
 		schema,
 		relations,
 		clientStorage,
+		initialClientId,
 		clientStorageWriteInterval,
 		rng,
 	}: DatabaseArgs<Schema, Relations>) {
@@ -176,27 +184,40 @@ export class Database<
 				() => this.persistStorageBatch(),
 				clientStorageWriteTimer,
 			)
-			this.tupleDb.subscribe({}, (writes) => {
-				this.storageWrites = WriteOpsApi.merge(this.storageWrites, writes)
-				void this.persistClientStorage()?.then(
-					(result) => {
-						if (result instanceof Error)
+		}
+		const initialize = () => {
+			// Hydration restores an existing checkpoint; do not enqueue it for saving again.
+			if (this.clientStorage)
+				this.tupleDb.subscribe({}, (writes) => {
+					this.storageWrites = WriteOpsApi.merge(this.storageWrites, writes)
+					void this.persistClientStorage()?.then(
+						(result) => {
+							if (result instanceof Error)
+								this.logger.error({
+									message: "error committing to storage",
+									error: result,
+								})
+						},
+						(error) =>
 							this.logger.error({
 								message: "error committing to storage",
-								error: result,
-							})
-					},
-					(error) =>
-						this.logger.error({
-							message: "error committing to storage",
-							error,
-						}),
-				)
-			})
+								error,
+							}),
+					)
+				})
+			if (initialClientId && !this.tupleDb.get(["replica"]))
+				this.initializeReplica(initialClientId)
+			this.initialized = true
 		}
-		this.ready = this.clientStorage
-			? this.loadFromStorage(this.clientStorage)
-			: Promise.resolve()
+		if (this.clientStorage) {
+			this.ready = this.loadFromStorage(this.clientStorage).then((result) => {
+				if (result instanceof Error) throw result
+				initialize()
+			})
+		} else {
+			initialize()
+			this.ready = Promise.resolve()
+		}
 	}
 
 	clear(clientId?: ClientId) {
@@ -220,11 +241,12 @@ export class Database<
 	 */
 	private async loadFromStorage(storage: TandemClientStorage<Schema>) {
 		this.logger.info({ message: "loading from storage" })
-		const records = await storage.scan(
-			normalizeTupleBounds({ prefix: ["record"] }),
-		)
+		const checkpoint = await storage
+			.scan()
+			.catch((cause) => new ClientStorageError({ operation: "scan", cause }))
+		if (checkpoint instanceof Error) return checkpoint
 		// Restore Schema-specific storage values into the namespace-wide root view.
-		this.tupleDb.commit({ set: records as TandemClientTuple<AnySchema>[] })
+		this.tupleDb.commit({ set: checkpoint as TandemClientTuple<AnySchema>[] })
 	}
 
 	private async persistStorageBatch() {
