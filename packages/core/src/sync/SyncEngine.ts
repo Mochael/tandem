@@ -129,6 +129,10 @@ export class SyncEngine<Schema extends AnySchema> {
 		return this.db.replica.clientId
 	}
 
+	get isConnected(): boolean {
+		return this.disconnectFromRemote !== undefined
+	}
+
 	constructor(args: SyncEngineArgs<Schema>) {
 		this.logger = args.logger
 		this.remote = args.remote
@@ -161,13 +165,23 @@ export class SyncEngine<Schema extends AnySchema> {
 		}
 	}
 
-	async connect(): Promise<AsyncUnsubscribe> {
+	/**
+	 * Connects, then pulls and pushes pending mutations. With `waitForSync:
+	 * false`, resolves once connected and syncs in the background.
+	 */
+	async connect({ waitForSync = true } = {}): Promise<AsyncUnsubscribe> {
 		const connected = await this.connectToRemote()
 		if (connected instanceof Error) throw connected
-		await this.queuePull()
-		if (this.db.outbox.scan({ limit: 1 }).length) {
-			await this.syncQueue.enqueue("push")
-		}
+		const synced = this.queuePull().then(async () => {
+			if (this.db.outbox.scan({ limit: 1 }).length) {
+				await this.syncQueue.enqueue("push")
+			}
+		})
+		if (waitForSync) await synced
+		else
+			synced.catch((error: unknown) => {
+				this.logger.error({ message: "error syncing after connect", error })
+			})
 		return () => this.disconnect()
 	}
 
@@ -247,6 +261,8 @@ export class SyncEngine<Schema extends AnySchema> {
 		})
 		// A response from before clear() must not acknowledge the new session.
 		if (clientId !== this.clientId) return
+		// A response that arrives after disconnect is dropped; the next connect pulls again.
+		if (!this.disconnectFromRemote) return
 		if ("error" in response) {
 			return new RemoteResponseError({ operation: "pull", cause: response })
 		}
@@ -263,9 +279,12 @@ export class SyncEngine<Schema extends AnySchema> {
 		return this.db.persistClientStorage()
 	}
 
-	commit(transaction: Transaction<Schema>): Promise<void> {
+	commit(
+		transaction: Transaction<Schema>,
+		forwarded?: { clientId: ClientId; mutationId: MutationId },
+	): Promise<void> {
 		const clientId = this.clientId
-		this.db.commitMutation(transaction)
+		this.db.commitMutation(transaction, forwarded)
 		const pendingCheckpoint = this.db.persistClientStorage()
 		if (!pendingCheckpoint) return this.syncQueue.enqueue("push")
 		return pendingCheckpoint.then((checkpoint) => {
@@ -274,6 +293,11 @@ export class SyncEngine<Schema extends AnySchema> {
 			this.logger.info({ message: "queueing push" })
 			return this.syncQueue.enqueue("push")
 		})
+	}
+
+	/** Push pending mutations without waiting for another commit. */
+	queuePush(): Promise<void> {
+		return this.syncQueue.enqueue("push")
 	}
 
 	private async push() {

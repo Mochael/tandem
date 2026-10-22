@@ -11,11 +11,30 @@ import type {
 } from "./schema/Schema.js"
 import type { TandemClientStorageApi } from "./clientStorage/TandemClientStorage.js"
 import { SyncEngine, type ClientId, type RemoteApi } from "./sync/SyncEngine.js"
+import {
+	browserTabEnvironment,
+	type TabEnvironmentApi,
+} from "./tabs/TabEnvironment.js"
+import { TabHub } from "./tabs/TabHub.js"
+import { TabSession } from "./tabs/TabSession.js"
 import { Transaction } from "./transaction/Transaction.js"
 import { ConsoleLoggerSink, Logger, type LoggerApi } from "./utils/Logger.js"
 import { randomId, type RngApi } from "./utils/randomId.js"
 import type { TimerApi } from "./utils/Timer.js"
-import type { AsyncUnsubscribe } from "./utils/typeUtils.js"
+import { tag, type AsyncUnsubscribe } from "./utils/typeUtils.js"
+
+export type TandemTabsOptions = {
+	/**
+	 * Clients with the same name share one replica across tabs.
+	 * @default clientStorage.name
+	 */
+	name?: string
+	/**
+	 * Locks and channels shared by the tabs.
+	 * @default Web Locks and BroadcastChannel in a browser document
+	 */
+	environment?: TabEnvironmentApi
+}
 
 export type TandemClientArgs<
 	Schema extends AnySchema,
@@ -45,6 +64,28 @@ export type TandemClientArgs<
 	 */
 	syncInterval?: number | TimerApi
 	autoConnect?: boolean
+	/**
+	 * Share `clientStorage` with other tabs. One tab, the leader, owns the
+	 * storage and the remote; every tab syncs an in-memory replica with it.
+	 * On by default in browsers when the storage has a name and a remote is
+	 * configured. `false` gives this client the storage to itself.
+	 */
+	tabs?: TandemTabsOptions | false
+}
+
+function resolveTabs<Schema extends AnySchema>(
+	tabs: TandemTabsOptions | false | undefined,
+	clientStorage: TandemClientStorageApi<Schema> | undefined,
+	remote: RemoteApi<Schema> | undefined,
+) {
+	if (tabs === false || !remote || !clientStorage) return undefined
+	const name = tabs?.name ?? clientStorage.name
+	const environment = tabs?.environment ?? browserTabEnvironment()
+	if (!tabs) return name && environment ? { name, environment } : undefined
+	if (!name) throw new Error("tabs requires a name or a named clientStorage")
+	if (!environment)
+		throw new Error("tabs requires an environment outside browser documents")
+	return { name, environment }
 }
 
 export class TandemClient<
@@ -70,6 +111,9 @@ export class TandemClient<
 	}
 
 	private readonly syncEngine?: SyncEngine<Schema>
+	private readonly tabSession?: TabSession<Schema, Relations>
+	/** Whether this tab wants the leader connected to the remote. */
+	private wantsRemote = false
 	private readonly logger: LoggerApi
 	private readonly rng: RngApi
 
@@ -83,10 +127,93 @@ export class TandemClient<
 		autoConnect = true,
 		rng,
 		syncInterval = 150,
+		tabs,
 	}: TandemClientArgs<Schema, Relations>) {
 		this.rng = rng ?? { randomId }
 		this.initialClientId = this.rng.randomId() as ClientId
 		this.logger = logger ?? new Logger({ sinks: new ConsoleLoggerSink() })
+
+		const sharedTabs = resolveTabs(tabs, clientStorage, remote)
+		if (sharedTabs && remote && clientStorage) {
+			// This tab's replica lives in memory. The leader tab, possibly this one,
+			// holds the persisted replica and its remote connection.
+			this.db = new Database({
+				schema,
+				relations,
+				logger: this.logger.scope("db"),
+				initialClientId: this.initialClientId,
+				clientStorageWriteInterval,
+				rng: this.rng,
+			})
+			this.tabSession = new TabSession<Schema, Relations>({
+				...sharedTabs,
+				schema,
+				logger: this.logger.scope("tab-session"),
+				rng: this.rng,
+				lead: async (channel) => {
+					const leaderDb = new Database({
+						schema,
+						relations,
+						logger: this.logger.scope("leader-db"),
+						clientStorage,
+						initialClientId: tag<ClientId>(this.rng.randomId()),
+						clientStorageWriteInterval,
+						rng: this.rng,
+					})
+					// The hub connects once a tab asks, after restoring the queries tabs sync.
+					const leaderSyncEngine = new SyncEngine({
+						remote,
+						db: leaderDb,
+						autoConnect: false,
+						logger: this.logger.scope("leader-sync-engine"),
+						rng: this.rng,
+						syncInterval,
+					})
+					await leaderDb.ready
+					const hub = new TabHub({
+						channel,
+						db: leaderDb,
+						syncEngine: leaderSyncEngine,
+						schema,
+						logger: this.logger.scope("tab-hub"),
+						rng: this.rng,
+					})
+					hub.start()
+					return hub
+				},
+				onLeaderChange: () => {
+					// Pull from the new leader, then resend anything it has not acknowledged.
+					const syncEngine = this.syncEngine!
+					void syncEngine
+						.disconnect()
+						.then(() => syncEngine.connect())
+						.then(() => this.requestRemote())
+						.catch((error: unknown) => {
+							this.logger.error({
+								message: "error following new leader",
+								error,
+							})
+						})
+				},
+			})
+			this.syncEngine = new SyncEngine({
+				remote: this.tabSession,
+				db: this.db,
+				autoConnect: false,
+				logger: this.logger.scope("sync-engine"),
+				rng: this.rng,
+				syncInterval,
+			})
+			this.wantsRemote = autoConnect
+			// Ready once the first pull from the leader restores the shared replica.
+			this.ready = this.syncEngine.connect().then(() => {
+				// Like a single tab's auto-connect, a failure is logged, not thrown.
+				void this.requestRemote().catch((error: unknown) => {
+					this.logger.error({ message: "error connecting to remote", error })
+				})
+			})
+			return
+		}
 
 		this.db = new Database({
 			schema,
@@ -118,6 +245,10 @@ export class TandemClient<
 		}
 
 		this.logger.info({ message: "pulling from remote" })
+		if (this.tabSession)
+			return this.tabSession
+				.control(this.clientId, "pullFromRemote")
+				.then(() => this.syncEngine!.queuePull())
 		return this.syncEngine.queuePull()
 	}
 
@@ -184,6 +315,12 @@ export class TandemClient<
 		if (!this.syncEngine) {
 			throw new Error("Attempted to connect without a remote server configured")
 		}
+		if (this.tabSession) {
+			// Tabs stay connected to the leader. It stays connected to the remote while any tab asks.
+			this.wantsRemote = true
+			await this.requestRemote()
+			return () => this.disconnect()
+		}
 		return await this.syncEngine.connect()
 	}
 
@@ -194,6 +331,10 @@ export class TandemClient<
 			})
 			return
 		}
+		if (this.tabSession) {
+			this.wantsRemote = false
+			return await this.tabSession.control(this.clientId, "disconnect")
+		}
 		return await this.syncEngine.disconnect()
 	}
 
@@ -201,6 +342,11 @@ export class TandemClient<
 	 * Flush any pending writes to client storage immediately.
 	 */
 	async flushClientStorage(): Promise<void> {
+		if (this.tabSession) {
+			// The leader answers a push once its storage holds the writes.
+			await this.syncEngine!.queuePush()
+			return await this.tabSession.control(this.clientId, "flush")
+		}
 		const result = await this.db.flushClientStorage()
 		if (result instanceof Error) throw result
 	}
@@ -213,8 +359,34 @@ export class TandemClient<
 		this.logger.info({ message: "clearing database" })
 		if (!this.db.isReady) await this.ready
 
+		if (this.tabSession) {
+			const previous = this.clientId
+			await this.tabSession.control(previous, "clear")
+			await this.syncEngine!.clear()
+			await this.requestRemote()
+			await this.tabSession.control(previous, "leave")
+			return await this.syncEngine!.queuePull()
+		}
 		if (this.syncEngine) return this.syncEngine.clear()
 		const result = await this.db.clear()
 		if (result instanceof Error) throw result
+	}
+
+	private async requestRemote() {
+		if (this.wantsRemote)
+			await this.tabSession!.control(this.clientId, "connect")
+	}
+
+	/**
+	 * Stop syncing. A leader tab saves its replica and hands leadership to
+	 * another tab before this resolves.
+	 */
+	async close() {
+		if (!this.tabSession) return await this.disconnect()
+		await this.flushClientStorage().catch((error: unknown) => {
+			this.logger.error({ message: "error flushing before close", error })
+		})
+		await this.syncEngine!.disconnect()
+		await this.tabSession.close(this.clientId)
 	}
 }

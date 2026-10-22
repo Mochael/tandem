@@ -19,8 +19,13 @@ import {
 import {
 	type RelationalQuery,
 	type RelationalQueryResult,
+	type ScanWindow,
 } from "./query/Query.js"
-import { executeQuerySync } from "./query/executeQuery.js"
+import {
+	executeQuerySync,
+	executeScanWindowSync,
+	type ScanWindowRecord,
+} from "./query/executeQuery.js"
 import {
 	TandemClientStorage,
 	type TandemClientBase,
@@ -41,7 +46,7 @@ import type { LoggerApi } from "./utils/Logger.js"
 import type { RngApi } from "./utils/randomId.js"
 import { ThrottleQueue } from "./utils/ThrottleQueue.js"
 import { Timer, type TimerApi } from "./utils/Timer.js"
-import { tag, unreachable } from "./utils/typeUtils.js"
+import { tag, unreachable, type Unsubscribe } from "./utils/typeUtils.js"
 
 class ClientStorageError extends errore.createTaggedError({
 	name: "ClientStorageError",
@@ -131,6 +136,15 @@ export class Database<
 		return this.tupleDb.subspace(["outbox"]) as unknown as TupleDatabaseClient<
 			TupleClientOutbox<Schema>
 		>
+	}
+
+	private get sessions() {
+		return this.tupleDb.subspace([
+			"session",
+		]) as unknown as TupleDatabaseClient<{
+			key: [ClientId]
+			value: { lastMutationId?: MutationId; scanWindow?: ScanWindow<Schema> }
+		}>
 	}
 
 	get replica() {
@@ -302,7 +316,15 @@ export class Database<
 		transaction.tupleDbTx.commit()
 	}
 
-	commitMutation(transaction: Transaction<Schema>): void {
+	/**
+	 * Commits a pending mutation. A leader forwarding a tab's mutation records
+	 * that tab's mutation ID in the same transaction, so the forwarded write and
+	 * its deduplication marker persist together.
+	 */
+	commitMutation(
+		transaction: Transaction<Schema>,
+		forwarded?: { clientId: ClientId; mutationId: MutationId },
+	): void {
 		const tx = transaction.tupleDbTx
 		const replica = this.replica
 		const id = tag<MutationId>(replica.lastIssuedMutationId + 1)
@@ -321,7 +343,69 @@ export class Database<
 		}
 		transaction.outbox.set([id], [...transaction.ops])
 		tx.set(["replica"], { ...replica, lastIssuedMutationId: id })
+		if (forwarded)
+			tx.set(["session", forwarded.clientId], {
+				...this.sessions.get([forwarded.clientId]),
+				lastMutationId: forwarded.mutationId,
+			})
 		tx.commit()
+	}
+
+	/** The last mutation this replica committed for a forwarding tab session. */
+	sessionLastMutationId(clientId: ClientId): MutationId | undefined {
+		return this.sessions.get([clientId])?.lastMutationId
+	}
+
+	/** Saves a tab session's queries, so a later leader keeps syncing them. */
+	setSessionScanWindow(
+		clientId: ClientId,
+		scanWindow: ScanWindow<Schema> | undefined,
+	) {
+		const { scanWindow: _previous, ...session } =
+			this.sessions.get([clientId]) ?? {}
+		const tx = this.tupleDb.transact(this.rng.randomId())
+		if (scanWindow) tx.set(["session", clientId], { ...session, scanWindow })
+		else if (session.lastMutationId !== undefined)
+			tx.set(["session", clientId], session)
+		else tx.remove(["session", clientId])
+		tx.commit()
+	}
+
+	sessionScanWindows(): {
+		clientId: ClientId
+		scanWindow: ScanWindow<Schema>
+	}[] {
+		return this.sessions
+			.scan()
+			.flatMap(({ key: [clientId], value: { scanWindow } }) =>
+				scanWindow ? [{ clientId, scanWindow }] : [],
+			)
+	}
+
+	/** Every record, for a tab session that starts without a checkpoint. */
+	scanRecords(): ScanWindowRecord<Schema>[] {
+		return this.records
+			.scan()
+			.map(
+				({ key, value }) =>
+					({ collection: key[0], value }) as ScanWindowRecord<Schema>,
+			)
+	}
+
+	scanWindow(scanWindow: ScanWindow<Schema>) {
+		// Scan windows only read the record namespace, like queries.
+		return executeScanWindowSync<Schema, AnyRelations<Schema>>(
+			this.tupleDb as unknown as ReadOnlyTupleDatabaseClientApi<
+				SchemaToTupleSchema<Schema>
+			>,
+			this.relations ?? {},
+			scanWindow,
+		)
+	}
+
+	/** Calls back after each commit that writes records. */
+	subscribeToRecords(callback: () => void): Unsubscribe {
+		return this.tupleDb.subscribe({ prefix: ["record"] }, callback)
 	}
 
 	applyPull({ patch, lastMutationId, cookie }: PullResponse<Schema>): void {

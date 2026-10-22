@@ -5,6 +5,7 @@ import type {
 	CollectionName,
 	SchemaToTupleSchema,
 } from "../schema/Schema.js"
+import type { ScanWindow } from "../query/Query.js"
 import type { ClientId, Cookie } from "../sync/SyncEngine.js"
 import type { Mutation, MutationId } from "../transaction/Transaction.js"
 import { isEqual } from "../utils/objectUtils.js"
@@ -39,8 +40,21 @@ export type TandemClientTuple<Schema extends AnySchema> =
 			key: ["outbox", MutationId]
 			value: Mutation<Schema>["ops"]
 	  }
+	| {
+			/** A tab session's last forwarded mutation and the queries it syncs. */
+			key: ["session", ClientId]
+			value: {
+				lastMutationId?: MutationId
+				scanWindow?: ScanWindow<Schema>
+			}
+	  }
 
 export interface TandemClientStorageApi<Schema extends AnySchema> {
+	/**
+	 * Identifies storage that several tabs can open at once. Clients with the
+	 * same name elect one tab to own the storage and sync for the others.
+	 */
+	readonly name?: string
 	scan(args?: ScanStorageArgs): Promise<TandemClientTuple<Schema>[]>
 	/** Apply the whole batch atomically; resolve only after it is durable. */
 	commit(writes: WriteOps<TandemClientTuple<Schema>>): Promise<void>
