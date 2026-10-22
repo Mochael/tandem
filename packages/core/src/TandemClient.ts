@@ -20,7 +20,11 @@ import { TabSession } from "./tabs/TabSession.js"
 import { Transaction } from "./transaction/Transaction.js"
 import { ConsoleLoggerSink, Logger, type LoggerApi } from "./utils/Logger.js"
 import { randomId, type RngApi } from "./utils/randomId.js"
-import type { TimerApi } from "./utils/Timer.js"
+import {
+	TaskTimer,
+	VisibilityAwareTimer,
+	type TimerApi,
+} from "./utils/Timer.js"
 import { tag, type AsyncUnsubscribe } from "./utils/typeUtils.js"
 
 export type TandemTabsOptions = {
@@ -59,7 +63,8 @@ export type TandemClientArgs<
 	logger?: LoggerApi
 	rng?: RngApi
 	/**
-	 * Milliseconds between sync batches, or a host-provided timer.
+	 * Milliseconds between sync batches, or a host-provided timer. With shared
+	 * tabs this paces the leader's remote sync; tabs reach the leader at once.
 	 * @default 150
 	 */
 	syncInterval?: number | TimerApi
@@ -71,6 +76,14 @@ export type TandemClientArgs<
 	 * configured. `false` gives this client the storage to itself.
 	 */
 	tabs?: TandemTabsOptions | false
+}
+
+// The leader often sits in a hidden tab, where browsers delay timers. It keeps
+// its batching intervals while visible and runs on the next task while hidden.
+function leaderTimer(interval: number | TimerApi): TimerApi {
+	return typeof interval === "number"
+		? new VisibilityAwareTimer({ interval })
+		: interval
 }
 
 function resolveTabs<Schema extends AnySchema>(
@@ -157,7 +170,7 @@ export class TandemClient<
 						logger: this.logger.scope("leader-db"),
 						clientStorage,
 						initialClientId: tag<ClientId>(this.rng.randomId()),
-						clientStorageWriteInterval,
+						clientStorageWriteInterval: leaderTimer(clientStorageWriteInterval),
 						rng: this.rng,
 					})
 					// The hub connects once a tab asks, after restoring the queries tabs sync.
@@ -167,7 +180,7 @@ export class TandemClient<
 						autoConnect: false,
 						logger: this.logger.scope("leader-sync-engine"),
 						rng: this.rng,
-						syncInterval,
+						syncInterval: leaderTimer(syncInterval),
 					})
 					await leaderDb.ready
 					const hub = new TabHub({
@@ -202,7 +215,8 @@ export class TandemClient<
 				autoConnect: false,
 				logger: this.logger.scope("sync-engine"),
 				rng: this.rng,
-				syncInterval,
+				// The leader is in this browser, so a tab sends to it without waiting to batch.
+				syncInterval: new TaskTimer(),
 			})
 			this.wantsRemote = autoConnect
 			// Ready once the first pull from the leader restores the shared replica.

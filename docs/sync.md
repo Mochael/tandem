@@ -114,11 +114,12 @@ Tabs of one origin share IndexedDB. Two clients writing the same store would reu
 - The leader tab holds a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) named after the storage. It owns the persisted replica, its client ID, and the connection to the remote.
 - Every tab, the leader included, keeps an in-memory replica with its own client ID and syncs it with the leader over a `BroadcastChannel`, using the same push, pull, and poke protocol a server uses. Queries stay synchronous.
 - The leader commits each forwarded mutation to its replica and records the tab's mutation ID in the same transaction. It acknowledges a tab's mutation only after storage holds it, and skips a mutation it already holds. A tab's `commit` resolves once the leader has saved the write; the leader pushes it to the remote and retries like a single tab.
-- Writes in one tab reach the others through the leader, without a remote round trip, so tabs stay in step while offline.
+- Writes in one tab reach the others through the leader, without a remote round trip, so tabs stay in step while offline. Tabs send to the leader on the next task rather than waiting for `syncInterval`, which paces only the leader's remote sync.
+- Browsers delay timers in hidden tabs. While its tab is hidden, the leader skips its `syncInterval` and `clientStorageWriteInterval` waits and runs on the next task instead, so a background leader does not slow the tab in use.
 - A tab's first pull returns the leader's whole replica, so `ready` restores persisted data as a single tab does. Later pulls follow the tab's subscriptions.
 - When the leader closes or crashes, its lock is released and a waiting tab loads the replica from storage and takes over. It keeps syncing every tab's saved queries, and tabs resend unanswered requests to it.
 
-The leader stays connected to the remote while any tab wants it: `connect` and `disconnect` change only this tab's wish, and `autoConnect` sets it initially. `pullFromRemote`, `flushClientStorage`, and `clear` act on the leader's replica. `close()` hands leadership on after saving. Pass `tabs: false` to give one client the storage to itself, or `tabs: { environment }` to coordinate somewhere other than a browser document, such as a worker or a test with `InMemoryTabs`.
+The leader stays connected to the remote while any tab wants it: `connect` and `disconnect` change only this tab's wish, and `autoConnect` sets it initially. `pullFromRemote`, `flushClientStorage`, and `clear` act on the leader's replica. `close()` hands leadership on after saving. Pass `tabs: false` to give one client the storage to itself, or `tabs: { environment }` to coordinate somewhere other than a browser document, such as a worker or a test with `InMemoryTabs` from `@tanishqkancharla/tandem-core/internal`.
 
 ## Next steps
 

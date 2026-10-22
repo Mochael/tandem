@@ -1,16 +1,5 @@
 export { TandemClient } from "./TandemClient.js"
 export type { TandemClientArgs, TandemTabsOptions } from "./TandemClient.js"
-export {
-	browserTabEnvironment,
-	InMemoryTab,
-	InMemoryTabs,
-} from "./tabs/TabEnvironment.js"
-export type {
-	TabChannelApi,
-	TabEnvironmentApi,
-	TabLocksApi,
-	TabMessageListener,
-} from "./tabs/TabEnvironment.js"
 export { SyncEngine } from "./sync/SyncEngine.js"
 export type {
 	ClientApi,

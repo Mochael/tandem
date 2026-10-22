@@ -2,10 +2,8 @@ import {
 	codec,
 	collection,
 	defineSchema,
-	InMemoryTabs,
 	type AnySchema,
 	type ClientApi,
-	type InMemoryTab,
 	type Mutation,
 	type RemoteApi,
 	type RuntimeSchemaDefinition,
@@ -14,7 +12,11 @@ import {
 	type TandemClientStorageApi,
 	TandemClientIndexedDbStorage,
 } from "@tanishqkancharla/tandem-core"
-import { describe, expect } from "vitest"
+import {
+	InMemoryTabs,
+	type InMemoryTab,
+} from "@tanishqkancharla/tandem-core/internal"
+import { describe, expect, vi } from "vitest"
 import { test, todo, type TestsSchema } from "./fixtures.js"
 
 type Tab<Schema extends AnySchema> = {
@@ -25,7 +27,7 @@ type Tab<Schema extends AnySchema> = {
 
 type OpenTabOptions<Schema extends AnySchema> = Pick<
 	TandemClientArgs<Schema, {}>,
-	"autoConnect"
+	"autoConnect" | "syncInterval"
 > & {
 	/** Runs after each storage commit completes, before the leader continues. */
 	afterStorageCommit?: (
@@ -482,6 +484,57 @@ describe("TandemClient tabs", () => {
 			await expect.poll(() => tabs.remote.stalledPushes).toBeGreaterThan(0)
 			await first.client.clear()
 			expect(first.client.query({ collection: "todos" })).toEqual([])
+		},
+	)
+
+	tabsTest(
+		"tabs reach the leader without waiting for the sync interval",
+		async ({ tabs }) => {
+			// A minute between remote syncs; tabs must not wait on it to reach the leader.
+			const first = await tabs.open("tab1", { syncInterval: 60_000 })
+			const second = await tabs.open("tab2", { syncInterval: 60_000 })
+			first.client.subscribe({ collection: "todos" })
+
+			const tx = second.client.transact()
+			tx.set("todos", todo("local"))
+			await second.client.commit(tx)
+			await expect
+				.poll(() => first.client.query({ collection: "todos" }))
+				.toEqual([todo("local")])
+		},
+	)
+
+	tabsTest(
+		"a hidden leader syncs with the remote without waiting on throttled timers",
+		async ({ tabs, server }) => {
+			// Hidden tabs delay timers; a minute-long interval stands in for that.
+			vi.stubGlobal("document", {
+				visibilityState: "hidden",
+				addEventListener() {},
+				removeEventListener() {},
+			})
+			try {
+				const first = await tabs.open("tab1", { syncInterval: 60_000 })
+				first.client.subscribe({ collection: "todos" })
+
+				// A tab's write reaches the remote.
+				const tx = first.client.transact()
+				tx.set("todos", todo("pushed"))
+				await first.client.commit(tx)
+				await expect
+					.poll(() => server.query({ collection: "todos" }))
+					.toEqual([todo("pushed")])
+
+				// A remote change reaches the tab.
+				const serverTx = server.transact()
+				serverTx.set("todos", todo("pulled"))
+				await server.commit(serverTx)
+				await expect
+					.poll(() => first.client.query({ collection: "todos" }))
+					.toEqual([todo("pulled"), todo("pushed")])
+			} finally {
+				vi.unstubAllGlobals()
+			}
 		},
 	)
 

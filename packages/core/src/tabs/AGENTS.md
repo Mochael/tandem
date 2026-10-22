@@ -11,6 +11,7 @@ Lets browser tabs share one persisted client replica. One tab leads: it owns the
 const client = new TandemClient({ schema, remote, clientStorage })
 
 // Elsewhere (a worker, tests), pass the locks and channels explicitly
+import { InMemoryTabs } from "@tanishqkancharla/tandem-core/internal"
 const tabs = new InMemoryTabs()
 const client = new TandemClient({
 	schema,
@@ -31,11 +32,12 @@ await client.close() // saves, then hands leadership to another tab
 6. **Connection**: each tab asks the leader to connect or disconnect. The leader stays connected to the remote while any tab wants it, and tabs repeat their wish to a new leader. `autoConnect` sets a tab's initial wish.
 7. **Pokes**: any commit that writes records pokes every session.
 8. **Codecs**: records cross the channel by structured clone, so collection codecs encode values before sending and decode them on receipt.
+9. **Timing**: a session's `SyncEngine` uses `TaskTimer`, so it reaches the leader on the next task instead of after `syncInterval`. The leader's `SyncEngine` and storage queue use `VisibilityAwareTimer`: their usual intervals while the page is visible, the next task while it is hidden, because browsers delay timers in hidden tabs but not messages.
 
 ## Limits
 
 - A crashed follower keeps its queries in the leader's scan window, and its wish to stay connected, until the leader changes. Session markers that hold a mutation ID are never pruned.
 - A follower's `commit` does not report remote push failures; the leader logs and retries them.
-- A leader in a hidden tab runs on throttled timers, which slows other tabs' writes and pulls.
+- A frozen leader tab (paused entirely, not just throttled) answers nothing until it resumes. Chrome does not freeze tabs that hold a Web Lock; other browsers may.
 - Coordination needs a storage name and an environment. Without them a client owns its storage alone, so custom storage shared by tabs must set `name`.
 - `clear()` in one tab clears the leader's replica for every tab. Other tabs keep and resend their unacknowledged mutations.
