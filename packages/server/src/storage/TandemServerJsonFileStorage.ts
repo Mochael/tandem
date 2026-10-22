@@ -52,38 +52,28 @@ function isNotFoundError(value: unknown): boolean {
 export class TandemServerJsonFileStorage<
 	Schema extends AnySchema = AnySchema,
 > implements TandemServerStorageApi<Schema> {
-	private memory = new InMemoryTupleStorage()
-	private initialization:
-		| Promise<TandemServerJsonFileStorageError | undefined>
-		| undefined
 	private queue: Promise<void> = Promise.resolve()
 
 	constructor(private readonly args: TandemServerJsonFileStorageArgs) {}
 
 	scan(args?: ScanStorageArgs): Promise<TandemTuple<Schema>[]> {
 		return this.run(async () => {
-			const initialized = await this.initialize()
-			if (initialized instanceof Error) return initialized
+			const memory = await this.loadFromDisk()
+			if (memory instanceof Error) return memory
 
 			// tuple-database's in-memory storage erases its tuple generic. The data
 			// comes from typed writes or a file previously written by this adapter.
-			return this.scanMemory(this.memory, args)
+			return this.scanMemory(memory, args)
 		})
 	}
 
 	commit(writes: WriteOps<TandemTuple<Schema>>): Promise<void> {
 		return this.run(async () => {
-			const initialized = await this.initialize()
-			if (initialized instanceof Error) return initialized
+			const memory = await this.loadFromDisk()
+			if (memory instanceof Error) return memory
 
-			const nextMemory = new InMemoryTupleStorage()
-			nextMemory.commit({ set: this.memory.scan() })
-			nextMemory.commit(writes)
-
-			const persisted = await this.writeToDisk(this.scanMemory(nextMemory))
-			if (persisted instanceof Error) return persisted
-
-			this.memory = nextMemory
+			memory.commit(writes)
+			return this.writeToDisk(this.scanMemory(memory))
 		})
 	}
 
@@ -109,22 +99,18 @@ export class TandemServerJsonFileStorage<
 		return result
 	}
 
-	private initialize() {
-		this.initialization ??= this.loadFromDisk()
-		return this.initialization
-	}
-
 	private scanMemory(memory: InMemoryTupleStorage, args?: ScanStorageArgs) {
 		return memory.scan(args) as TandemTuple<Schema>[]
 	}
 
 	private async loadFromDisk() {
+		const memory = new InMemoryTupleStorage()
 		const raw = await runFileOperation({
 			operation: "read",
 			filePath: this.args.filePath,
 			promise: fs.readFile(this.args.filePath, "utf8"),
 		})
-		if (raw instanceof Error && isNotFoundError(raw.cause)) return undefined
+		if (raw instanceof Error && isNotFoundError(raw.cause)) return memory
 		if (raw instanceof Error) return raw
 
 		const tuples = errore.try({
@@ -138,7 +124,8 @@ export class TandemServerJsonFileStorage<
 		})
 		if (tuples instanceof Error) return tuples
 
-		this.memory.commit({ set: tuples })
+		memory.commit({ set: tuples })
+		return memory
 	}
 
 	private async writeToDisk(tuples: TandemTuple<Schema>[]) {
