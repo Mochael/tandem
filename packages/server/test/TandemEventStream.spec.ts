@@ -204,3 +204,23 @@ test("responds unavailable when the remote cannot register the stream", async ()
 		message: "Remote is down",
 	})
 })
+
+test("logs the cause when registering the stream throws", async () => {
+	const logged = vi.spyOn(console, "error").mockImplementation(() => {})
+	onTestFinished(() => void logged.mockRestore())
+	const cause = new Error("Storage is unreachable")
+
+	const response = await createTandemEventStreamResponse({
+		remote: { connect: () => Promise.reject(cause) },
+		clientId: tag<ClientId>("throwing"),
+	})
+	expect(response.status).toBe(503)
+	expect(await response.json()).toEqual({
+		error: "unavailable",
+		message: "Tandem server connect failed",
+	})
+
+	// The response only carries the message, so the cause has to reach the log.
+	expect(logged).toHaveBeenCalledTimes(1)
+	expect(logged.mock.calls[0]?.[0]).toMatchObject({ cause })
+})

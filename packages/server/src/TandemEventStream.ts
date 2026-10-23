@@ -69,6 +69,8 @@ export async function createTandemEventStreamResponse({
 		.connect({ clientId, poke })
 		.catch((cause) => new TandemServerError({ operation: "connect", cause }))
 	if (connected instanceof Error || typeof connected !== "function") {
+		// The response carries only the message, so keep the cause for the operator.
+		if (connected instanceof Error) console.error(connected)
 		return Response.json(
 			{ error: "unavailable", message: connected.message },
 			{ status: 503 },
