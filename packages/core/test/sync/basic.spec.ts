@@ -430,3 +430,39 @@ describe("TandemClient sync", () => {
 		})
 	})
 })
+
+test("overlapping connect and disconnect calls leave one remote registration", async ({
+	server,
+}) => {
+	const registrations = new Set<() => Promise<void>>()
+	const remote: RemoteApi<TestsSchema> = {
+		push: (args) => server.push(args),
+		pull: (args) => server.pull(args),
+		connect: async (api) => {
+			const unsubscribe = await server.connect(api)
+			if (typeof unsubscribe !== "function") return unsubscribe
+			registrations.add(unsubscribe)
+			return () => {
+				registrations.delete(unsubscribe)
+				return unsubscribe()
+			}
+		},
+	}
+	const client = new TandemClient<TestsSchema>({
+		remote,
+		schema: testsRuntimeSchema,
+		autoConnect: false,
+		syncInterval: 0,
+	})
+
+	// React StrictMode connects, disconnects, and reconnects before the first connect resolves.
+	const firstConnect = client.connect()
+	const disconnect = client.disconnect()
+	const secondConnect = client.connect()
+	await Promise.all([firstConnect, disconnect, secondConnect])
+	expect(registrations.size).toBe(1)
+
+	// Disconnecting releases the remaining registration.
+	await client.disconnect()
+	expect(registrations.size).toBe(0)
+})

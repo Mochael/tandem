@@ -1174,6 +1174,24 @@ test("application commits poke connected clients until they disconnect or close"
 	await disconnectSecond()
 })
 
+test("overlapping connections for one client disconnect independently", async () => {
+	const { server } = createServer()
+	const clientId = tag<ClientId>("reconnecting-client")
+	const stalePoke = vi.fn()
+	const replacementPoke = vi.fn()
+	await server.connect({ clientId, poke: replacementPoke })
+	// The stale stream's request can arrive after its replacement registered.
+	const disconnectStale = await server.connect({ clientId, poke: stalePoke })
+
+	// Closing the stale stream keeps the replacement live.
+	await disconnectStale()
+	const tx = server.transact()
+	tx.set("users", { id: "user-1", name: "Ada" })
+	await server.commit(tx)
+	expect(stalePoke).not.toHaveBeenCalled()
+	expect(replacementPoke).toHaveBeenCalledTimes(1)
+})
+
 test("failed pushes do not acknowledge, advance, or poke", async () => {
 	const { server, storage } = createServer()
 	const clientId = tag<ClientId>("failing-client")
