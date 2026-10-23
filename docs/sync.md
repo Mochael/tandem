@@ -92,6 +92,14 @@ sequenceDiagram
 	C->>C: Apply patch, reset to base, replay pending
 ```
 
+## Previews
+
+`client.preview(collection, value, { version })` shows a record the server has produced but the client has not pulled yet, such as a streamed agent reply. Queries return the preview instead of the synced record. Previews never enter the pending mutations, so they are never pushed.
+
+Each pull rebuilds the record as usual, then applies the preview on top. A pull drops the preview when the pulled record's `version` field is at least the preview's, or when it removes the record. A record missing from a reset snapshot counts as removed only if the client had it before. After a pull removes a record, previews of it are ignored until a pull delivers it again. A local commit to the record, `clearPreview`, and `clear` also drop a preview. Previews do not survive a restart: the restarted client shows the synced record.
+
+The server must eventually persist every version it previews.
+
 ## Conflicts
 
 Conflicts resolve as last write wins per record, in the order the remote applies pushes. Say clients A and B both edit todo `1`:

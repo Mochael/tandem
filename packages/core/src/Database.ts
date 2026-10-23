@@ -36,7 +36,12 @@ import {
 	type TupleClientRecord,
 	Transaction,
 } from "./transaction/Transaction.js"
-import type { ClientId, PullResponse } from "./sync/SyncEngine.js"
+import type {
+	ClientId,
+	PatchRemoveOp,
+	PatchSetOp,
+	PullResponse,
+} from "./sync/SyncEngine.js"
 import type { LoggerApi } from "./utils/Logger.js"
 import type { RngApi } from "./utils/randomId.js"
 import { ThrottleQueue } from "./utils/ThrottleQueue.js"
@@ -78,6 +83,34 @@ function applyOp<Schema extends AnySchema>(
 	}
 }
 
+function recordKeyId(key: readonly unknown[]): string {
+	return JSON.stringify(key)
+}
+
+/** A server-produced value shown before a pull delivers it. Never pushed or persisted. */
+type RecordPreview<Schema extends AnySchema> = {
+	key: TupleClientRecord<Schema>["key"]
+	value: Schema[CollectionName<Schema>]
+	/** Numeric record field compared against the pulled server value. */
+	version: string
+}
+
+function readVersion(record: object, version: string): number | undefined {
+	const value = (record as globalThis.Record<string, unknown>)[version]
+	return typeof value === "number" ? value : undefined
+}
+
+/** Whether `server` is at least as new as `preview`, by the preview's version field. */
+function hasCaughtUp(server: object, preview: object, version: string) {
+	const serverVersion = readVersion(server, version)
+	const previewVersion = readVersion(preview, version)
+	return (
+		serverVersion !== undefined &&
+		previewVersion !== undefined &&
+		serverVersion >= previewVersion
+	)
+}
+
 export type DatabaseArgs<
 	Schema extends AnySchema,
 	Relations extends AnyRelations<Schema>,
@@ -106,6 +139,11 @@ export class Database<
 	private readonly clientStorageWriteQueue?: ThrottleQueue<void | ClientStorageError>
 	private storageWrites: WriteOps<TandemClientTuple<AnySchema>> = {}
 	private storageClearQueued = false
+	// Previews are transient UI state. Saved records can include them, so
+	// hydration rebuilds tracked records from their bases.
+	private readonly previews = new Map<string, RecordPreview<Schema>>()
+	// Records a pull removed. A late stream event must not preview them back.
+	private readonly removedByServer = new Set<string>()
 	private initialized = false
 	readonly ready: Promise<void>
 
@@ -207,6 +245,7 @@ export class Database<
 				})
 			if (initialClientId && !this.tupleDb.get(["replica"]))
 				this.initializeReplica(initialClientId)
+			if (this.clientStorage) this.dropRestoredPreviews()
 			this.initialized = true
 		}
 		if (this.clientStorage) {
@@ -224,6 +263,8 @@ export class Database<
 		// Supersede queued old-session writes; an active batch finishes before the clear batch.
 		this.storageWrites = {}
 		this.storageClearQueued = true
+		this.previews.clear()
+		this.removedByServer.clear()
 		const tx = this.tupleDb.transact(this.rng.randomId())
 		for (const { key } of tx.scan({})) tx.remove(key)
 		if (clientId)
@@ -306,8 +347,12 @@ export class Database<
 		const tx = transaction.tupleDbTx
 		const replica = this.replica
 		const id = tag<MutationId>(replica.lastIssuedMutationId + 1)
+		const supersededPreviews: string[] = []
 		for (const op of transaction.ops) {
 			const recordKey = mutationOpToRecordKey(op)
+			// A local write replaces any preview of the record it writes.
+			if (this.previews.has(recordKeyId(recordKey)))
+				supersededPreviews.push(recordKeyId(recordKey))
 			// Pending bookkeeping reads the current checkpoint, not the user's draft read set.
 			const base = this.bases.get(recordKey)
 			// The draft already contains optimistic edits; capture the committed record instead.
@@ -322,12 +367,14 @@ export class Database<
 		transaction.outbox.set([id], [...transaction.ops])
 		tx.set(["replica"], { ...replica, lastIssuedMutationId: id })
 		tx.commit()
+		for (const previewId of supersededPreviews) this.previews.delete(previewId)
 	}
 
 	applyPull({ patch, lastMutationId, cookie }: PullResponse<Schema>): void {
 		const transaction = this.transact()
 		const tx = transaction.tupleDbTx
 		const { records, bases, outbox } = transaction
+		const removedRecords = this.recordsRemovedBy(patch)
 		if (patch.reset) {
 			for (const { key } of records.scan()) records.remove(key)
 			for (const { key, value } of bases.scan()) {
@@ -340,6 +387,70 @@ export class Database<
 			this.applyServerOp(transaction, { type: "remove", ...op })
 		for (const { key } of outbox.scan({ lte: [lastMutationId] }))
 			outbox.remove(key)
+		const trackedBases = this.rebuildTrackedRecords(transaction)
+		const retiredPreviews = new Set<string>()
+		for (const [previewId, preview] of this.previews) {
+			const server = bases.get(preview.key)?.server
+			const retired =
+				server?.type === "set"
+					? hasCaughtUp(server.value, preview.value, preview.version)
+					: // An absent record may not have reached this client's view yet.
+						removedRecords.has(previewId)
+			if (retired) retiredPreviews.add(previewId)
+			else records.set(preview.key, preview.value)
+		}
+		// Restoration still needs acknowledged bases, especially for records outside the scan window.
+		for (const { key, value } of trackedBases) {
+			const previewId = recordKeyId(key)
+			const previewed =
+				this.previews.has(previewId) && !retiredPreviews.has(previewId)
+			if (value.lastWrittenBy <= lastMutationId && !previewed) bases.remove(key)
+		}
+		tx.set(["replica"], { ...this.replica, cookie })
+		tx.commit()
+		for (const previewId of retiredPreviews) this.previews.delete(previewId)
+		for (const op of patch.set ?? [])
+			this.removedByServer.delete(
+				recordKeyId(mutationOpToRecordKey({ type: "set", ...op })),
+			)
+		for (const previewId of removedRecords) this.removedByServer.add(previewId)
+	}
+
+	/**
+	 * Records this pull removes from the confirmed replica: explicit removes, and
+	 * on reset, every previously confirmed record missing from the snapshot.
+	 */
+	private recordsRemovedBy(patch: PullResponse<Schema>["patch"]) {
+		const removed = new Set(
+			(patch.remove ?? []).map((op) =>
+				recordKeyId(mutationOpToRecordKey({ type: "remove", ...op })),
+			),
+		)
+		if (!patch.reset) return removed
+		const snapshot = new Set(
+			(patch.set ?? []).map((op) =>
+				recordKeyId(mutationOpToRecordKey({ type: "set", ...op })),
+			),
+		)
+		const confirmed = [
+			...this.records
+				.scan()
+				.filter(({ key }) => !this.bases.get(key))
+				.map(({ key }) => key),
+			...this.bases
+				.scan()
+				.filter(({ value }) => value.server.type === "set")
+				.map(({ key }) => key),
+		]
+		for (const key of confirmed) {
+			if (!snapshot.has(recordKeyId(key))) removed.add(recordKeyId(key))
+		}
+		return removed
+	}
+
+	/** Reset every record with a base to its server value, then replay the outbox. */
+	private rebuildTrackedRecords(transaction: Transaction<Schema>) {
+		const { records, bases, outbox } = transaction
 		const trackedBases = bases.scan()
 		for (const { key, value } of trackedBases) {
 			switch (value.server.type) {
@@ -357,12 +468,96 @@ export class Database<
 		for (const { value: ops } of outbox.scan()) {
 			for (const op of ops) applyOp(transaction, op)
 		}
-		// Restoration still needs acknowledged bases, especially for records outside the scan window.
-		for (const { key, value } of trackedBases) {
-			if (value.lastWrittenBy <= lastMutationId) bases.remove(key)
+		return trackedBases
+	}
+
+	/**
+	 * Saved records can include previews, but previews are not saved. Only a
+	 * preview keeps a base whose last writer is no longer pending, and no
+	 * pending operation writes that record, so restore its server value.
+	 */
+	private dropRestoredPreviews() {
+		const transaction = this.transact()
+		const { records, bases, outbox } = transaction
+		let restored = false
+		for (const { key, value } of bases.scan()) {
+			if (outbox.get([value.lastWrittenBy])) continue
+			restored = true
+			switch (value.server.type) {
+				case "set":
+					records.set(key, value.server.value)
+					break
+				case "remove":
+					records.remove(key)
+					break
+				default:
+					unreachable(value.server)
+			}
+			bases.remove(key)
 		}
-		tx.set(["replica"], { ...this.replica, cookie })
-		tx.commit()
+		if (!restored) return transaction.cancel()
+		transaction.tupleDbTx.commit()
+	}
+
+	/**
+	 * Show a server-produced value until a pull delivers a record at least as new.
+	 * Previews never enter the outbox, so they are never pushed.
+	 */
+	preview(op: PatchSetOp<Schema>, version: string): void {
+		const key = mutationOpToRecordKey({ type: "set", ...op })
+		const previewId = recordKeyId(key)
+		if (this.removedByServer.has(previewId)) return
+		const current = this.previews.get(previewId)
+		// Stream events can arrive late or out of order; never move backwards.
+		if (current && hasCaughtUp(current.value, op.value, version)) return
+		const base = this.bases.get(key)
+		const committed = this.records.get(key)
+		const server: TandemClientBase<Schema[CollectionName<Schema>]>["server"] =
+			base?.server ??
+			(committed === undefined
+				? { type: "remove" }
+				: { type: "set", value: committed })
+		if (server.type === "set" && hasCaughtUp(server.value, op.value, version))
+			return
+
+		const transaction = this.transact()
+		// The base keeps the server value so pulls can rebuild beneath the preview.
+		if (!base)
+			transaction.bases.set(key, { server, lastWrittenBy: tag<MutationId>(0) })
+		transaction.records.set(key, op.value)
+		transaction.tupleDbTx.commit()
+		this.previews.set(previewId, { key, value: op.value, version })
+	}
+
+	clearPreview(op: PatchRemoveOp<Schema>): void {
+		const key = mutationOpToRecordKey({ type: "remove", ...op })
+		const previewId = recordKeyId(key)
+		if (!this.previews.has(previewId)) return
+		const base = this.bases.get(key)
+		if (!base) throw new Error("A preview must keep its record's base")
+
+		const transaction = this.transact()
+		const { records, bases, outbox } = transaction
+		switch (base.server.type) {
+			case "set":
+				records.set(key, base.server.value)
+				break
+			case "remove":
+				records.remove(key)
+				break
+			default:
+				unreachable(base.server)
+		}
+		for (const { value: ops } of outbox.scan()) {
+			for (const op of ops) {
+				if (recordKeyId(mutationOpToRecordKey(op)) === previewId)
+					applyOp(transaction, op)
+			}
+		}
+		// Keep the base only while a pending mutation still writes this record.
+		if (!outbox.get([base.lastWrittenBy])) bases.remove(key)
+		transaction.tupleDbTx.commit()
+		this.previews.delete(previewId)
 	}
 
 	private applyServerOp(

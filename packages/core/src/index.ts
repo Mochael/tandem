@@ -1,5 +1,9 @@
 export { TandemClient } from "./TandemClient.js"
-export type { TandemClientArgs } from "./TandemClient.js"
+export type {
+	TandemClientArgs,
+	TandemPreviewOptions,
+	TandemPreviewVersionField,
+} from "./TandemClient.js"
 export { SyncEngine } from "./sync/SyncEngine.js"
 export type {
 	ClientApi,
