@@ -64,7 +64,9 @@ type QueryNode<
 }
 
 type RecordsByCollection<Schema extends AnySchema> = {
-	readonly [Collection in CollectionName<Schema>]?: readonly Schema[Collection][]
+	readonly [
+		Collection in CollectionName<Schema>
+	]?: readonly Schema[Collection][]
 }
 
 type MutableRecordsByCollection<Schema extends AnySchema> = {
@@ -519,22 +521,24 @@ export async function executeQueryAsync<
 	)
 }
 
-export async function executeScanWindowAsync<
-	Schema extends AnySchema,
-	Relations extends AnyRelations<Schema>,
->(
-	db: ReadOnlyAsyncTupleDatabaseClientApi<SchemaToTupleSchema<Schema>>,
-	relations: Relations,
+function normalizeScanWindow<Schema extends AnySchema>(
 	scanWindow: ScanWindow<Schema>,
-): Promise<ScanWindowRecord<Schema>[] | InvalidScanWindowError> {
+	relations: AnyRelations<Schema>,
+): QueryNode<Schema>[] | InvalidScanWindowError {
 	const queries: QueryNode<Schema>[] = []
 	for (const query of scanWindow) {
 		const normalized = normalizeEncodedQuery(query, relations)
 		if (normalized instanceof Error) return normalized
 		queries.push(normalized)
 	}
-	const collections = getQueryCollections(queries)
-	const recordsByCollection = await loadRecordsAsync(db, collections)
+	return queries
+}
+
+function collectScanWindow<Schema extends AnySchema>(
+	queries: readonly QueryNode<Schema>[],
+	relations: AnyRelations<Schema>,
+	recordsByCollection: RecordsByCollection<Schema>,
+): ScanWindowRecord<Schema>[] {
 	const result: ScanWindowRecord<Schema>[] = []
 	const seen = new Map<CollectionName<Schema>, Set<string>>()
 	const collectRow: QueryRowCollector<Schema> = (collection, value) => {
@@ -558,4 +562,35 @@ export async function executeScanWindowAsync<
 	}
 
 	return result
+}
+
+export async function executeScanWindowAsync<
+	Schema extends AnySchema,
+	Relations extends AnyRelations<Schema>,
+>(
+	db: ReadOnlyAsyncTupleDatabaseClientApi<SchemaToTupleSchema<Schema>>,
+	relations: Relations,
+	scanWindow: ScanWindow<Schema>,
+): Promise<ScanWindowRecord<Schema>[] | InvalidScanWindowError> {
+	const queries = normalizeScanWindow(scanWindow, relations)
+	if (queries instanceof Error) return queries
+	const recordsByCollection = await loadRecordsAsync(
+		db,
+		getQueryCollections(queries),
+	)
+	return collectScanWindow(queries, relations, recordsByCollection)
+}
+
+export function executeScanWindowSync<
+	Schema extends AnySchema,
+	Relations extends AnyRelations<Schema>,
+>(
+	db: ReadOnlyTupleDatabaseClientApi<SchemaToTupleSchema<Schema>>,
+	relations: Relations,
+	scanWindow: ScanWindow<Schema>,
+): ScanWindowRecord<Schema>[] | InvalidScanWindowError {
+	const queries = normalizeScanWindow(scanWindow, relations)
+	if (queries instanceof Error) return queries
+	const recordsByCollection = loadRecordsSync(db, getQueryCollections(queries))
+	return collectScanWindow(queries, relations, recordsByCollection)
 }
