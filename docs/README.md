@@ -6,6 +6,7 @@
 - [Quickstart](quickstart.md): build a synced todo app with React
 - [Queries](queries.md): query options, relations, and subscriptions
 - [Server](server.md): run `TandemServer` and connect clients to it
+- [Agent chat](agent-chat.md): stream agent replies without a second writer
 
 ## Concepts
 
