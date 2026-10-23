@@ -64,11 +64,11 @@ Remotes call `poke` from any signal they choose. The quickstart and todo example
 `createTandemEventStreamResponse` in `@tanishqkancharla/tandem-server` turns a remote's `connect` into a web-standard `Response`. It registers the poke callback first, then writes `ready`, so a pull started from `ready` sees every write committed after registration:
 
 ```callstack
- createTandemEventStreamResponse [[es:new:31-107]]
- ├── remote.connect({ clientId, poke }) [[es:new:68-76]] # 503 if registration fails
- ├── setInterval(heartbeat) [[es:new:78-81]] # ": keep-alive" every 15 s, skipped while the reader is behind
- ├── enqueue("event: ready") [[es:new:94-98]]
- └── close on signal abort or body cancel [[es:new:82-92]] # clear timer, unregister once
+ createTandemEventStreamResponse [[es:new:31-109]]
+ ├── remote.connect({ clientId, poke }) [[es:new:68-78]] # 503 if registration fails, cause logged
+ ├── setInterval(heartbeat) [[es:new:80-83]] # ": keep-alive" every 15 s, skipped while the reader is behind
+ ├── enqueue("event: ready") [[es:new:96-100]]
+ └── close on signal abort or body cancel [[es:new:84-94]] # clear timer, unregister once
 ```
 
 `poke` only enqueues a frame, so commits never wait on a browser. When the reader is behind, pokes collapse into one pending frame that `pull` writes next, and heartbeats are skipped because queued frames already keep the connection busy. A stalled response holds at most the ready event and one poke:
@@ -109,7 +109,7 @@ sequenceDiagram
 	T->>S: poke()
 	S-->>B: event: poke
 	B->>T: POST pull
-	%% ref node:S [[es:new:31-107]]
+	%% ref node:S [[es:new:31-109]]
 	%% ref node:B [[src:new:22-63]]
 ```
 
@@ -270,10 +270,10 @@ index 4e6e1ef..a65a2a6 100644
 ```source-diff:es:packages/server/src/TandemEventStream.ts
 diff --git a/packages/server/src/TandemEventStream.ts b/packages/server/src/TandemEventStream.ts
 new file mode 100644
-index 0000000..1512a03
+index 0000000..ed9f4bf
 --- /dev/null
 +++ b/packages/server/src/TandemEventStream.ts
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,109 @@
 +import type {
 +	AnySchema,
 +	ClientId,
@@ -345,6 +345,8 @@ index 0000000..1512a03
 +		.connect({ clientId, poke })
 +		.catch((cause) => new TandemServerError({ operation: "connect", cause }))
 +	if (connected instanceof Error || typeof connected !== "function") {
++		// The response carries only the message, so keep the cause for the operator.
++		if (connected instanceof Error) console.error(connected)
 +		return Response.json(
 +			{ error: "unavailable", message: connected.message },
 +			{ status: 503 },
