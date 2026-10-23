@@ -36,7 +36,7 @@ Across a network, the client's `remote` is a transport that forwards `push` and 
 
 After every commit that writes data, the server pokes each connected client.
 
-`createTandemEventStreamResponse` serves those pokes to browsers as server-sent events, and `connectTandemEventSource` from `@tanishqkancharla/tandem-core` turns them back into `poke` calls. Events carry no data; the client pulls over the normal transport. The stream sends `ready` after it registers, so the client pulls once per connection and catches writes it missed while disconnected. It also sends a keep-alive comment every 15 seconds and closes when the request aborts or the body is cancelled. The [Quickstart](quickstart.md#5-add-a-server) shows both sides.
+`createTandemEventStreamResponse` serves those pokes to browsers as server-sent events, and `connectTandemEventSource` from `@tanishqkancharla/tandem-core` turns them back into `poke` calls. Events carry no data; the client pulls over the normal transport. The stream sends `ready` after it registers, so the client pulls once per connection and catches writes it missed while disconnected. It also sends a keep-alive comment every 15 seconds and closes when the request aborts or the body is cancelled. Open streams keep an HTTP server from closing, so combine the request signal with a shutdown signal, as [`examples/todo`](../examples/todo/apps/server/src/app.ts) does. The [Quickstart](quickstart.md#5-add-a-server) shows both sides.
 
 ## Read and write on the server
 
