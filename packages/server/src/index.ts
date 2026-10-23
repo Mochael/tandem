@@ -12,3 +12,5 @@ export type {
 } from "./storage/TandemServerStorage.js"
 export { TandemServerJsonFileStorage } from "./storage/TandemServerJsonFileStorage.js"
 export type { TandemServerJsonFileStorageArgs } from "./storage/TandemServerJsonFileStorage.js"
+export { createTandemEventStreamResponse } from "./TandemEventStream.js"
+export type { TandemEventStreamArgs } from "./TandemEventStream.js"

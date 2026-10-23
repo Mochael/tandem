@@ -192,13 +192,34 @@ const server = new TandemServer({
 // In your HTTP framework:
 // POST /api/tandem { action: "push", args } -> await server.push(args)
 // POST /api/tandem { action: "pull", args } -> await server.pull(args)
+// GET /api/tandem/events?clientId=... -> return the response below
+```
+
+The events route streams pull hints to the browser as server-sent events. It returns a standard `Response`, so fetch-style frameworks such as Hono can return it directly:
+
+```ts
+import { tag, type ClientId } from "@tanishqkancharla/tandem-core"
+import { createTandemEventStreamResponse } from "@tanishqkancharla/tandem-server"
+
+function events(request: Request) {
+	const clientId = new URL(request.url).searchParams.get("clientId")
+	if (!clientId) return new Response("Missing clientId", { status: 400 })
+	return createTandemEventStreamResponse({
+		remote: server,
+		clientId: tag<ClientId>(clientId),
+		signal: request.signal,
+	})
+}
 ```
 
 On the client, implement `RemoteApi` by forwarding each call to that endpoint.
 
 ```ts
 // client/remote.ts
-import type { RemoteApi } from "@tanishqkancharla/tandem-core"
+import {
+	connectTandemEventSource,
+	type RemoteApi,
+} from "@tanishqkancharla/tandem-core"
 import type { TodoSchema } from "../shared/schema"
 
 async function call(action: "push" | "pull", args: unknown) {
@@ -212,10 +233,11 @@ async function call(action: "push" | "pull", args: unknown) {
 }
 
 export const todoRemote: RemoteApi<TodoSchema> = {
-	async connect({ poke }) {
-		// Poll for changes. Use a WebSocket or SSE to poke on demand instead.
-		const timer = setInterval(poke, 1000)
-		return async () => clearInterval(timer)
+	async connect({ clientId, poke }) {
+		return connectTandemEventSource({
+			url: `/api/tandem/events?clientId=${encodeURIComponent(clientId)}`,
+			poke,
+		})
 	},
 	async push(args) {
 		await call("push", args)
@@ -223,6 +245,8 @@ export const todoRemote: RemoteApi<TodoSchema> = {
 	pull: (args) => call("pull", args),
 }
 ```
+
+`connectTandemEventSource` pulls when the stream opens or reconnects, on every server poke, and every 60 seconds as a fallback (`pullInterval`). The browser's `EventSource` reconnects dropped streams on its own.
 
 The client only pulls data for queries it subscribes to, so another client's writes appear once a matching `subscribe` or `useTandemQuery` is active.
 
