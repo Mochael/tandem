@@ -16,7 +16,7 @@ export type TandemEventSourceArgs = {
  * Pokes the client from server-sent `ready` and `poke` events.
  *
  * `ready` arrives after every (re)connection, so the client pulls changes it
- * missed while disconnected. Fallback pulls bound staleness when events are lost.
+ * missed while disconnected. Fallback pulls check for updates whose pokes were lost.
  * Returns a function that closes the stream and stops all timers.
  */
 export function connectTandemEventSource({

@@ -42,8 +42,10 @@ export async function createTandemEventStreamResponse({
 	const enqueue = (frame: Uint8Array) => {
 		if (!closed) controller.enqueue(frame)
 	}
+	const hasCapacity = () =>
+		controller.desiredSize !== null && controller.desiredSize > 0
 	const poke = () => {
-		if (controller.desiredSize !== null && controller.desiredSize > 0) {
+		if (hasCapacity()) {
 			enqueue(pokeFrame)
 		} else {
 			pokePending = true
@@ -73,10 +75,10 @@ export async function createTandemEventStreamResponse({
 		)
 	}
 
-	const heartbeat = setInterval(
-		() => enqueue(heartbeatFrame),
-		heartbeatInterval,
-	)
+	// Queued frames already keep the connection busy, so a stalled reader skips heartbeats.
+	const heartbeat = setInterval(() => {
+		if (hasCapacity()) enqueue(heartbeatFrame)
+	}, heartbeatInterval)
 	const close = () => {
 		if (closed) return
 		closed = true

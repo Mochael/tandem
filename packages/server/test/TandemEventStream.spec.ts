@@ -1,6 +1,6 @@
 import { collection, defineSchema, tag } from "@tanishqkancharla/tandem-core"
 import type { ClientId, MutationId } from "@tanishqkancharla/tandem-core"
-import { expect, test } from "vitest"
+import { expect, onTestFinished, test, vi } from "vitest"
 import { createTandemEventStreamResponse, TandemServer } from "../src/index.js"
 import { TestTandemServerStorage } from "./TandemServerStorage.fixture.js"
 
@@ -96,6 +96,44 @@ test("sends keep-alive comments while idle", async () => {
 	expect(await events.next()).toBe(": keep-alive")
 
 	await events.reader.cancel()
+	await server.close()
+})
+
+test("a stalled reader keeps one pending poke and no backlog of keep-alives", async () => {
+	vi.useFakeTimers()
+	onTestFinished(() => void vi.useRealTimers())
+	const server = createServer()
+	const response = await createTandemEventStreamResponse({
+		remote: server,
+		clientId: tag<ClientId>("stalled"),
+		heartbeatInterval: 1_000,
+	})
+	const reader = response.body!.getReader()
+	const decoder = new TextDecoder()
+	const next = async () => decoder.decode((await reader.read()).value)
+
+	// Writes and heartbeat intervals pass while nothing reads the stream.
+	for (const name of ["Ada", "Grace"]) {
+		const tx = server.transact()
+		tx.set("users", { id: name, name })
+		await server.commit(tx)
+	}
+	await vi.advanceTimersByTimeAsync(10_000)
+
+	// Reading resumes with the queued ready event and one coalesced poke.
+	expect(await next()).toBe("event: ready\ndata:\n\n")
+	expect(await next()).toBe("event: poke\ndata:\n\n")
+
+	// Nothing else was retained; the next frame waits for a fresh heartbeat.
+	let received: string | undefined
+	const pending = next().then((frame) => (received = frame))
+	await vi.advanceTimersByTimeAsync(0)
+	expect(received).toBeUndefined()
+	await vi.advanceTimersByTimeAsync(1_000)
+	await pending
+	expect(received).toBe(": keep-alive\n\n")
+
+	await reader.cancel()
 	await server.close()
 })
 
