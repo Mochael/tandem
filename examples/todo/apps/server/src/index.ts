@@ -81,6 +81,7 @@ async function start() {
 					if (closed instanceof Error) console.error(closed)
 				})
 		})
+		service.endEventStreams()
 	}
 
 	process.once("SIGINT", shutdown)
