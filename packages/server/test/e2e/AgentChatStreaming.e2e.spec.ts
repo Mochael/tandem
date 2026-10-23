@@ -12,6 +12,7 @@ import {
 	TandemServer,
 	TandemServerJsonFileStorage,
 } from "@tanishqkancharla/tandem-server"
+import * as errore from "errore"
 import { expect, test as baseTest, vi } from "vitest"
 
 // The reference shape for agent chat on Tandem, from docs/agent-chat.md.
@@ -34,15 +35,12 @@ const schema = defineSchema({
 	}),
 })
 
-/** A streamed change, sent only after the server has persisted it. */
-type ReplyDelta = { message: Omit<Message, "text">; delta: string }
-
 /**
  * The application server: Tandem for durable state, plus a separate stream
- * that carries each reply delta to subscribed clients without a pull.
+ * that sends each saved reply to every viewer of the thread without a pull.
  */
 class ChatServer {
-	private readonly listeners = new Set<(event: ReplyDelta) => void>()
+	private readonly listeners = new Set<(reply: Message) => void>()
 
 	constructor(
 		readonly tandem: TandemServer<ChatSchema, {}>,
@@ -81,7 +79,7 @@ class ChatServer {
 		}
 	}
 
-	subscribe(listener: (event: ReplyDelta) => void) {
+	subscribe(listener: (reply: Message) => void) {
 		this.listeners.add(listener)
 		return () => this.listeners.delete(listener)
 	}
@@ -114,29 +112,9 @@ class ChatServer {
 			const tx = this.tandem.transact()
 			tx.set("messages", reply)
 			await this.tandem.commit(tx)
-			const { text: _text, ...message } = reply
-			for (const listener of this.listeners) listener({ message, delta: token })
+			for (const listener of this.listeners) listener(reply)
 		}
 	}
-}
-
-/** Fold a streamed delta into the visible message as a preview. */
-function applyReplyDelta(
-	client: TandemClient<ChatSchema, {}>,
-	{ message, delta }: ReplyDelta,
-) {
-	const [visible] = client.query({
-		collection: "messages",
-		where: { id: message.id },
-	})
-	const seq = visible?.seq ?? 0
-	// Older events are already visible. After a gap, wait for sync to catch up.
-	if (message.seq !== seq + 1) return
-	client.preview(
-		"messages",
-		{ ...message, text: (visible?.text ?? "") + delta },
-		{ version: "seq" },
-	)
 }
 
 const test = baseTest.extend<{ tandem: TandemServer<ChatSchema, {}> }>({
@@ -157,31 +135,42 @@ const test = baseTest.extend<{ tandem: TandemServer<ChatSchema, {}> }>({
 	},
 })
 
-test("a streamed reply only grows on the client and the server, then converges", async ({
+test("a streamed reply only grows for every viewer and the server, then converges", async ({
 	tandem,
 }) => {
 	const tokens = ["Tandem ", "keeps ", "one ", "writer ", "per ", "record."]
 	const chat = new ChatServer(tandem, tokens)
-	const client = new TandemClient<ChatSchema, {}>({
-		schema,
-		remote: chat.remote({ pullLatency: 3 }),
-		logger: new Logger({ sinks: [] }),
-		syncInterval: 0,
-	})
-	await client.ready
-	const unsubscribeStream = chat.subscribe((event) =>
-		applyReplyDelta(client, event),
-	)
+	await using cleanup = new errore.AsyncDisposableStack()
 
-	const clientReplies: string[] = []
-	const thread = client.subscribe(
-		{ collection: "messages", where: { threadId: "thread-1" } },
-		(messages) => {
-			const reply = messages.find((message) => message.role === "assistant")
-			if (reply && reply.text !== clientReplies.at(-1))
-				clientReplies.push(reply.text)
-		},
-	)
+	// The sender and a friend watching the same thread see the same stream.
+	const viewers = ["client", "friend"].map(() => {
+		const viewer = new TandemClient<ChatSchema, {}>({
+			schema,
+			remote: chat.remote({ pullLatency: 3 }),
+			logger: new Logger({ sinks: [] }),
+			syncInterval: 0,
+		})
+		const replies: string[] = []
+		const thread = viewer.subscribe(
+			{ collection: "messages", where: { threadId: "thread-1" } },
+			(messages) => {
+				const reply = messages.find((message) => message.role === "assistant")
+				if (reply && reply.text !== replies.at(-1)) replies.push(reply.text)
+			},
+		)
+		const unsubscribeStream = chat.subscribe((reply) =>
+			viewer.preview("messages", reply, { version: "seq" }),
+		)
+		cleanup.defer(async () => {
+			unsubscribeStream()
+			thread.destroy()
+			await viewer.disconnect()
+		})
+		return { viewer, replies }
+	})
+	const [{ viewer: client }] = viewers
+	await Promise.all(viewers.map(({ viewer }) => viewer.ready))
+
 	const serverReplies: string[] = []
 	const serverThread = await tandem.subscribe(
 		{ collection: "messages", where: { role: "assistant" } },
@@ -190,6 +179,7 @@ test("a streamed reply only grows on the client and the server, then converges",
 				serverReplies.push(reply.text)
 		},
 	)
+	cleanup.defer(() => serverThread.destroy())
 
 	const tx = client.transact()
 	tx.set("messages", {
@@ -203,29 +193,28 @@ test("a streamed reply only grows on the client and the server, then converges",
 	await client.commit(tx)
 
 	const finalReply = tokens.join("")
-	await vi.waitFor(() => {
-		expect(
-			client.query({ collection: "messages", where: { role: "assistant" } }),
-		).toEqual([
-			{
-				id: "message-1:reply",
-				threadId: "thread-1",
-				role: "assistant",
-				text: finalReply,
-				seq: tokens.length,
-				status: "complete",
-			},
-		])
-	})
+	for (const { viewer } of viewers) {
+		await vi.waitFor(() => {
+			expect(
+				viewer.query({ collection: "messages", where: { role: "assistant" } }),
+			).toEqual([
+				{
+					id: "message-1:reply",
+					threadId: "thread-1",
+					role: "assistant",
+					text: finalReply,
+					seq: tokens.length,
+					status: "complete",
+				},
+			])
+		})
+	}
 
-	// Neither copy ever moves backwards, and the client sees every delta. The
-	// first delta can arrive before the pull that delivers the empty placeholder.
+	// No copy ever moves backwards, and both viewers see every chunk. The first
+	// chunk can arrive before the pull that delivers the empty placeholder.
 	const prefixes = tokens.map((_, index) => tokens.slice(0, index + 1).join(""))
-	expect(clientReplies.filter((text) => text !== "")).toEqual(prefixes)
+	for (const { replies } of viewers) {
+		expect(replies.filter((text) => text !== "")).toEqual(prefixes)
+	}
 	expect(serverReplies).toEqual(["", ...prefixes])
-
-	thread.destroy()
-	serverThread.destroy()
-	unsubscribeStream()
-	await client.disconnect()
 })

@@ -20,14 +20,14 @@ sequenceDiagram
 	S->>S: reply = "Hel"  (moves backwards)
 ```
 
-Holding streamed text in app state outside Tandem avoids the second writer, but it leaves no rule for when to return to the Tandem record. The pulled record can be older than the stream (a pull read the server before the latest delta), newer (the stream dropped events), or deleted.
+Holding streamed text in app state outside Tandem avoids the second writer, but it leaves no rule for when to return to the Tandem record. The pulled record can be older than the stream (a pull read the server before the latest chunk), newer (the stream dropped events), or deleted.
 
 ## Solution overview
 
 Treat streamed output like Tandem treats pending mutations: a layer over the server value that is discarded once the server value confirms it. Pending mutations retire by `lastMutationId`. Previews retire by a per-record version that the server increments on every persisted change.
 
-- The server is the only writer of assistant messages, persists each delta before publishing it, and increments `seq` with each persisted change.
-- The client calls `client.preview(collection, value, { version: "seq" })` for each delta. Previews never enter the outbox.
+- The server is the only writer of assistant messages, saves each chunk before publishing the whole saved message, and increments `seq` with each save.
+- The client calls `client.preview(collection, message, { version: "seq" })` for each streamed message. Previews never enter the outbox.
 - Each pull rebuilds records from bases and pending mutations, then applies previews that are still ahead of the pulled value.
 
 Persisting before publishing makes every preview a prefix of some future server state. Retirement therefore never shows an older value, and every preview eventually retires.
@@ -80,5 +80,5 @@ Records and bases are persisted as before. Previews are not, but saved records c
 
 ## Follow-ups
 
-- Patch-carrying pokes: push incremental patches with chained cookies over the poke channel, as Zero does. Server-written deltas would then reach clients in one hop without a separate stream, and previews would be needed only for unpersisted output.
+- Patch-carrying pokes: push incremental patches with chained cookies over the poke channel, as Zero does. Saved chunks would then reach clients in one hop without a separate stream, and previews would be needed only for unpersisted output.
 - An agent chat example app on top of the SSE poke transport.

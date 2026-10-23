@@ -14,8 +14,8 @@ Keeping the streamed text in separate local state avoids the second writer. But 
 
 1. One writer per record. The client writes user messages. Only the server writes assistant messages, and the push handler rejects client writes to them. Anything the client needs to say about a reply, such as a cancel request or a rating, goes in a record the client owns.
 2. The server starts inference from an accepted push. The reply's ID comes from the user message's ID and is claimed in a transaction, so a retried push does not start a second reply.
-3. The server persists each delta before streaming it. Every persisted change to a reply increments its `seq`. Never stream a `seq` the server will not persist.
-4. The client passes streamed deltas to `client.preview`, never to `commit`. Tandem drops a preview once a pull delivers the record with a `seq` at least as high.
+3. The server saves each new chunk of the reply, then streams the whole saved message to everyone viewing the thread. Every save increments the message's `seq`. Never stream a `seq` the server will not save.
+4. The client passes each streamed message to `client.preview`, never to `commit`. Tandem drops a preview once a pull delivers the message with a `seq` at least as high.
 
 ```mermaid
 sequenceDiagram
@@ -23,9 +23,9 @@ sequenceDiagram
 	participant S as Server
 	C->>S: push user message
 	S->>S: persist reply, seq 0
-	loop each delta
-		S->>S: persist reply, seq n
-		S-->>C: stream delta (seq n)
+	loop each chunk
+		S->>S: save reply, seq n
+		S-->>C: stream reply (seq n)
 		C->>C: preview reply at seq n
 	end
 	S-->>C: poke
@@ -34,7 +34,7 @@ sequenceDiagram
 	C->>C: drop preview, show synced reply
 ```
 
-A pull can read the server before a delta and arrive after it. The client keeps showing the preview, because the pulled `seq` is lower. Neither the client nor the server ever shows an older reply.
+A pull can read the server before a chunk and arrive after it. The client keeps showing the preview, because the pulled `seq` is lower. Neither the client nor the server ever shows an older reply.
 
 ## Data model
 
@@ -71,43 +71,31 @@ async push(args) {
 }
 ```
 
-Write each delta, then publish it:
+Save each chunk, then publish the saved message:
 
 ```ts
-reply = { ...reply, text: reply.text + token, seq: reply.seq + 1 }
+reply = { ...reply, text: reply.text + chunk, seq: reply.seq + 1 }
 const tx = server.transact()
 tx.set("messages", reply)
 await server.commit(tx)
-const { text, ...message } = reply
-stream.publish(reply.threadId, { message, delta: token })
+stream.publish(reply.threadId, reply)
 ```
 
-Each commit pokes connected clients. To reduce pull traffic, persist and publish deltas in batches, for example every 50 to 100 ms.
+Each commit pokes connected clients. To reduce pull traffic, group tokens into chunks, for example every 50 to 100 ms.
 
 If inference fails, persist a terminal status with a higher `seq`. That write replaces any preview the client is still showing.
 
 ## Client
 
-Fold each delta into the visible message and preview the result:
+Preview every streamed message:
 
 ```ts
-stream.subscribe(threadId, ({ message, delta }) => {
-	const [visible] = client.query({
-		collection: "messages",
-		where: { id: message.id },
-	})
-	const seq = visible?.seq ?? 0
-	// Older deltas are already visible. After a gap, wait for sync to catch up.
-	if (message.seq !== seq + 1) return
-	client.preview(
-		"messages",
-		{ ...message, text: (visible?.text ?? "") + delta },
-		{ version: "seq" },
-	)
+stream.subscribe(threadId, (message) => {
+	client.preview("messages", message, { version: "seq" })
 })
 ```
 
-The visible record holds the accumulated text, whether it came from a pull or an earlier preview. A client that joins mid-stream starts from the synced reply and applies the deltas that follow it. Deltas it missed are already persisted, so its next pull delivers them, and deltas after that apply again.
+That is all the client needs. `preview` ignores a message that is not newer than what the client already shows, so late, repeated, and out-of-order events are harmless. A client that joins mid-stream, or misses events, shows the synced message until the next streamed message or pull.
 
 Queries and subscriptions return the preview in place of the synced record. Tandem drops it when:
 
@@ -118,9 +106,23 @@ Queries and subscriptions return the preview in place of the synced record. Tand
 
 Previews live in memory. After a restart the client shows the synced record until the stream resumes.
 
+## Replies with several messages
+
+An agent turn often produces several messages: text, a tool call, a tool result, and more text. Store each as its own record with its own `seq`, for example with IDs `${userMessageId}:reply:0`, `:1`, and so on. Each has its own preview, and they retire independently. Order them with a field such as `index`.
+
+## Who sees the stream
+
+Publish to everyone viewing the thread, not only the sender. A friend with the same thread open sees the reply stream in, too. A viewer without the stream still sees each saved chunk through ordinary sync, a poke and a pull later.
+
+## Why stream at all
+
+Without the stream, every chunk costs each viewer a poke, then a pull request, and the pull response returns every record in the subscription, not just the changed one. The stream delivers the changed message in one hop, with no request. Updates show up sooner and arrive as smoothly as the server sends them. Saved chunks still poke clients, so grouping tokens into chunks keeps pull traffic down.
+
+Each streamed event carries the whole message so far. For very long replies, the server can stream only the new text, and the client appends it to the visible message before previewing. That saves bandwidth but adds client code to detect gaps.
+
 ## Without a stream
 
-If a poke and a pull per update is fast enough, skip the stream. The server writes deltas as above, and clients receive them through ordinary sync. Each pull returns every record in the client's scan window, so batch writes and scope subscriptions to the open thread.
+If a poke and a pull per update is fast enough, skip the stream. The server saves chunks as above, and clients receive them through ordinary sync. Each pull returns every record in the client's scan window, so batch writes and scope subscriptions to the open thread.
 
 ## Limitations
 
