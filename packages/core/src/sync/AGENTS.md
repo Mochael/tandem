@@ -19,7 +19,9 @@ const remote: RemoteApi<Schema> = {
 	},
 	async connect({ clientId, poke }) {
 		// Call poke() when the client should pull
-		return async () => { /* unregister this client */ }
+		return async () => {
+			/* unregister this client */
+		}
 	},
 }
 ```
@@ -33,6 +35,8 @@ const remote: RemoteApi<Schema> = {
 5. **Clear**: explicit `clear()` discards records, bases, and the outbox in one in-memory transaction. It starts a new client identity with a reset counter and cookie, preserves connected/disconnected state, and ignores old-session pull responses and pushes still waiting for storage. Storage clear runs after active saves and supersedes queued old-session writes. Await clearing before starting new work. Already dispatched writes are not cancelled or undone on the server.
 6. **Delivery**: each durable commit queues one push of the current pending snapshot. Failure rejects that commit promise but retains the mutation. A later commit includes older unacknowledged mutations; reconnect pulls first, then pushes anything still pending. Failed storage batches remain buffered before newer writes; explicit flush or later work can retry them. There is no automatic retry, backoff, or confirming-pull loop. Without another commit or reconnect, a lost request stays pending locally.
 7. **Pokes**: the remote tells a client when to pull. TaskQueue coalesces queued pulls; a poke during an in-flight pull queues a subsequent pull. Only a pull acknowledgement removes pending mutations, not a successful push response.
+
+8. **Previews**: `TandemClient.preview` shows server-produced values that arrived outside sync, such as streamed agent output. `Database` keeps previews in memory, never in the outbox. Previewing a record without a base saves its server value as a base with `lastWrittenBy` 0. A pull rebuilds records as usual, then retires each preview whose base value has a version field at least as high, or that the pull removed. Removed means an explicit remove, or a reset snapshot missing a record the client had confirmed before the pull; a reset snapshot may predate a record the stream already announced. `Database` remembers removed records in memory and ignores previews of them until a pull sets them again. Remaining previews are written over the rebuilt record, and their bases survive pruning. A local commit to a previewed record retires its preview. `clearPreview` restores the base, replays pending operations for that record, and drops the base unless its last writer is still in the outbox. Saved records can include previews, so hydration restores each record whose base outlived its last pending writer to the base value and drops that base. A preview over a still-pending write survives restart until the next pull.
 
 A confirmed write outside every subscription disappears on the next pull, because the server never sends that record back.
 

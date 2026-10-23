@@ -7,6 +7,7 @@ import {
 import type {
 	AnySchema,
 	AnyRelations,
+	CollectionName,
 	RuntimeSchemaDefinition,
 } from "./schema/Schema.js"
 import type { TandemClientStorageApi } from "./clientStorage/TandemClientStorage.js"
@@ -45,6 +46,20 @@ export type TandemClientArgs<
 	 */
 	syncInterval?: number | TimerApi
 	autoConnect?: boolean
+}
+
+/** Fields of `Record` that hold numbers, such as a sequence number or timestamp. */
+export type TandemPreviewVersionField<Record> = {
+	[Field in keyof Record]-?: Record[Field] extends number ? Field : never
+}[keyof Record] &
+	string
+
+export type TandemPreviewOptions<Record> = {
+	/**
+	 * The preview stays visible until a pulled record has this field at least as
+	 * high as the preview's value. The server must eventually persist that value.
+	 */
+	version: TandemPreviewVersionField<Record>
 }
 
 export class TandemClient<
@@ -178,6 +193,43 @@ export class TandemClient<
 		})
 
 		return commitPromise
+	}
+
+	/**
+	 * Show a record the server has produced but this client has not pulled yet,
+	 * such as a streamed agent response received over a separate channel.
+	 *
+	 * Queries return the preview instead of the synced record. Previews are never
+	 * pushed. A preview is dropped when a pull delivers the record with
+	 * `version` at least as high, when a pull removes the record, when this client
+	 * commits a write to it, or on `clearPreview`. A value older than the visible
+	 * preview or the synced record is ignored.
+	 */
+	preview<Collection extends CollectionName<Schema>>(
+		collection: Collection,
+		value: Schema[Collection],
+		options: TandemPreviewOptions<Schema[Collection]>,
+	): void {
+		this.assertCanPreview()
+		this.db.preview({ collection, value }, options.version)
+	}
+
+	/** Drop a preview and show the synced record with pending local writes. */
+	clearPreview<Collection extends CollectionName<Schema>>(
+		collection: Collection,
+		id: Schema[Collection]["id"],
+	): void {
+		this.assertCanPreview()
+		this.db.clearPreview({ collection, id })
+	}
+
+	private assertCanPreview() {
+		if (!this.syncEngine) {
+			throw new Error("Previews require a remote that can confirm them")
+		}
+		if (!this.db.isReady) {
+			throw new Error("Await client.ready before previewing records")
+		}
 	}
 
 	async connect(): Promise<AsyncUnsubscribe> {
