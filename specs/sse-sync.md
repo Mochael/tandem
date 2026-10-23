@@ -6,7 +6,7 @@ Browser clients learn about new server data only by polling. The todo example pu
 
 ## Solution overview
 
-Deliver pokes to browsers over server-sent events and keep HTTP POST push and pull as the only data path. A poke carries no data; it tells the client to pull. This is the Replicache model: SSE hint, then a normal pull, with a 60 second background pull as recovery. Electric uses SSE to stream data itself, which would duplicate Tandem's pull protocol.
+Deliver pokes to browsers over server-sent events and keep HTTP POST push and pull as the only data path. A poke carries no data; it tells the client to pull. This is the Replicache model: SSE hint, then a normal pull, with a background pull every 60 seconds to check for missed updates. Electric uses SSE to stream data itself, which would duplicate Tandem's pull protocol.
 
 ## Goals
 
@@ -64,21 +64,24 @@ Remotes call `poke` from any signal they choose. The quickstart and todo example
 `createTandemEventStreamResponse` in `@tanishqkancharla/tandem-server` turns a remote's `connect` into a web-standard `Response`. It registers the poke callback first, then writes `ready`, so a pull started from `ready` sees every write committed after registration:
 
 ```callstack
- createTandemEventStreamResponse [[es:new:31-105]]
- ├── remote.connect({ clientId, poke }) [[es:new:66-74]] # 503 if registration fails
- ├── setInterval(heartbeat) # ": keep-alive" every 15 s
- ├── enqueue("event: ready") [[es:new:92-96]]
- └── close on signal abort or body cancel [[es:new:80-90]] # clear timer, unregister once
+ createTandemEventStreamResponse [[es:new:31-107]]
+ ├── remote.connect({ clientId, poke }) [[es:new:68-76]] # 503 if registration fails
+ ├── setInterval(heartbeat) [[es:new:78-81]] # ": keep-alive" every 15 s, skipped while the reader is behind
+ ├── enqueue("event: ready") [[es:new:94-98]]
+ └── close on signal abort or body cancel [[es:new:82-92]] # clear timer, unregister once
 ```
 
-`poke` only enqueues a frame, so commits never wait on a browser. When the reader is behind, pokes collapse into one pending frame that `pull` writes next:
+`poke` only enqueues a frame, so commits never wait on a browser. When the reader is behind, pokes collapse into one pending frame that `pull` writes next, and heartbeats are skipped because queued frames already keep the connection busy. A stalled response holds at most the ready event and one poke:
 
 ```ts
 const poke = () => {
-	if (controller.desiredSize > 0) enqueue(pokeFrame)
+	if (hasCapacity()) enqueue(pokeFrame)
 	else pokePending = true
 	return Promise.resolve()
 }
+setInterval(() => {
+	if (hasCapacity()) enqueue(heartbeatFrame)
+}, heartbeatInterval)
 ```
 
 `connectTandemEventSource` in `@tanishqkancharla/tandem-core` is the browser side. It pulls on `ready`, on `poke`, and every 60 seconds. Native EventSource retries dropped streams; when the browser gives up (a non-200 response), the helper reopens after 5 seconds:
@@ -106,7 +109,7 @@ sequenceDiagram
 	T->>S: poke()
 	S-->>B: event: poke
 	B->>T: POST pull
-	%% ref node:S [[es:new:31-105]]
+	%% ref node:S [[es:new:31-107]]
 	%% ref node:B [[src:new:22-63]]
 ```
 
@@ -267,10 +270,10 @@ index 4e6e1ef..a65a2a6 100644
 ```source-diff:es:packages/server/src/TandemEventStream.ts
 diff --git a/packages/server/src/TandemEventStream.ts b/packages/server/src/TandemEventStream.ts
 new file mode 100644
-index 0000000..f48c4de
+index 0000000..1512a03
 --- /dev/null
 +++ b/packages/server/src/TandemEventStream.ts
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,107 @@
 +import type {
 +	AnySchema,
 +	ClientId,
@@ -315,8 +318,10 @@ index 0000000..f48c4de
 +	const enqueue = (frame: Uint8Array) => {
 +		if (!closed) controller.enqueue(frame)
 +	}
++	const hasCapacity = () =>
++		controller.desiredSize !== null && controller.desiredSize > 0
 +	const poke = () => {
-+		if (controller.desiredSize !== null && controller.desiredSize > 0) {
++		if (hasCapacity()) {
 +			enqueue(pokeFrame)
 +		} else {
 +			pokePending = true
@@ -346,10 +351,10 @@ index 0000000..f48c4de
 +		)
 +	}
 +
-+	const heartbeat = setInterval(
-+		() => enqueue(heartbeatFrame),
-+		heartbeatInterval,
-+	)
++	// Queued frames already keep the connection busy, so a stalled reader skips heartbeats.
++	const heartbeat = setInterval(() => {
++		if (hasCapacity()) enqueue(heartbeatFrame)
++	}, heartbeatInterval)
 +	const close = () => {
 +		if (closed) return
 +		closed = true
@@ -381,7 +386,7 @@ index 0000000..f48c4de
 ```source-diff:src:packages/core/src/sync/TandemEventSource.ts
 diff --git a/packages/core/src/sync/TandemEventSource.ts b/packages/core/src/sync/TandemEventSource.ts
 new file mode 100644
-index 0000000..b3e354b
+index 0000000..e02d665
 --- /dev/null
 +++ b/packages/core/src/sync/TandemEventSource.ts
 @@ -0,0 +1,63 @@
@@ -403,7 +408,7 @@ index 0000000..b3e354b
 + * Pokes the client from server-sent `ready` and `poke` events.
 + *
 + * `ready` arrives after every (re)connection, so the client pulls changes it
-+ * missed while disconnected. Fallback pulls bound staleness when events are lost.
++ * missed while disconnected. Fallback pulls check for updates whose pokes were lost.
 + * Returns a function that closes the stream and stops all timers.
 + */
 +export function connectTandemEventSource({
