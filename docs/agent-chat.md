@@ -1,0 +1,132 @@
+# Agent chat
+
+This guide shows how to build a streaming agent chat on Tandem. The user's messages sync like any other record. The agent's reply streams from the server over a separate channel, and the client shows it with `client.preview` until sync catches up.
+
+## Why the obvious approaches fail
+
+A user sends a message by committing it to Tandem. The server receives the push and starts inference. Tokens then reach the client over a WebSocket or SSE stream, outside Tandem's push and pull.
+
+Committing those tokens to Tandem makes the client a second writer of the reply. Each commit carries the text the client had when the token arrived, so it reaches the server at least a round trip after the server wrote newer text. A `set` replaces the whole record, so the server's reply moves backwards until the next token overwrites it.
+
+Keeping the streamed text in separate local state avoids the second writer. But then the app has to decide when to stop showing it and go back to the Tandem record. Switch too early and the reply jumps backwards. Switch too late and later server edits stay hidden.
+
+## The recommended path
+
+1. One writer per record. The client writes user messages. Only the server writes assistant messages, and the push handler rejects client writes to them. Anything the client needs to say about a reply, such as a cancel request or a rating, goes in a record the client owns.
+2. The server starts inference from an accepted push. The reply's ID comes from the user message's ID and is claimed in a transaction, so a retried push does not start a second reply.
+3. The server persists each delta before streaming it. Every persisted change to a reply increments its `seq`. Never stream a `seq` the server will not persist.
+4. The client passes streamed deltas to `client.preview`, never to `commit`. Tandem drops a preview once a pull delivers the record with a `seq` at least as high.
+
+```mermaid
+sequenceDiagram
+	participant C as Client
+	participant S as Server
+	C->>S: push user message
+	S->>S: persist reply, seq 0
+	loop each delta
+		S->>S: persist reply, seq n
+		S-->>C: stream delta (seq n)
+		C->>C: preview reply at seq n
+	end
+	S-->>C: poke
+	C->>S: pull
+	S->>C: reply at seq ≥ n
+	C->>C: drop preview, show synced reply
+```
+
+A pull can read the server before a delta and arrive after it. The client keeps showing the preview, because the pulled `seq` is lower. Neither the client nor the server ever shows an older reply.
+
+## Data model
+
+```ts
+type Message = {
+	id: string
+	threadId: string
+	role: "user" | "assistant"
+	text: string
+	/** Incremented by the server on every persisted change to an assistant message. */
+	seq: number
+	status: "streaming" | "complete"
+}
+```
+
+Store each message as its own record so that writes to one message cannot replace another. Subscribe to the open thread so pulls return its replies.
+
+## Server
+
+Wrap `TandemServer` in the transport the client calls. See [Custom remotes](custom-remote.md#wrapping-tandemserver).
+
+```ts
+async push(args) {
+	for (const { ops } of args.mutations) {
+		for (const op of ops) {
+			if (op.type !== "set" || op.value.role !== "user") {
+				return { error: "invalid-request", message: "Only the server writes assistant messages" }
+			}
+		}
+	}
+	const response = await server.push(args)
+	if (!("error" in response)) startReplies(args.mutations)
+	return response
+}
+```
+
+Write each delta, then publish it:
+
+```ts
+reply = { ...reply, text: reply.text + token, seq: reply.seq + 1 }
+const tx = server.transact()
+tx.set("messages", reply)
+await server.commit(tx)
+const { text, ...message } = reply
+stream.publish(reply.threadId, { message, delta: token })
+```
+
+Each commit pokes connected clients. To reduce pull traffic, persist and publish deltas in batches, for example every 50 to 100 ms.
+
+If inference fails, persist a terminal status with a higher `seq`. That write replaces any preview the client is still showing.
+
+## Client
+
+Fold each delta into the visible message and preview the result:
+
+```ts
+stream.subscribe(threadId, ({ message, delta }) => {
+	const [visible] = client.query({
+		collection: "messages",
+		where: { id: message.id },
+	})
+	const seq = visible?.seq ?? 0
+	// Older deltas are already visible. After a gap, wait for sync to catch up.
+	if (message.seq !== seq + 1) return
+	client.preview(
+		"messages",
+		{ ...message, text: (visible?.text ?? "") + delta },
+		{ version: "seq" },
+	)
+})
+```
+
+The visible record holds the accumulated text, whether it came from a pull or an earlier preview. A client that joins mid-stream starts from the synced reply and applies the deltas that follow it. Deltas it missed are already persisted, so its next pull delivers them, and deltas after that apply again.
+
+Queries and subscriptions return the preview in place of the synced record. Tandem drops it when:
+
+- a pull delivers the record with `seq` at least as high
+- a pull removes the record
+- the client commits its own write to the record
+- the app calls `client.clearPreview(collection, id)`
+
+Previews live in memory. After a restart the client shows the synced record until the stream resumes.
+
+## Without a stream
+
+If a poke and a pull per update is fast enough, skip the stream. The server writes deltas as above, and clients receive them through ordinary sync. Each pull returns every record in the client's scan window, so batch writes and scope subscriptions to the open thread.
+
+## Limitations
+
+- A preview of a record outside every subscription never retires, because pulls never return the record. Call `clearPreview` when its stream closes.
+- If the server streams a `seq` and then crashes before persisting it, the preview stays until restart or `clearPreview`. Persisting before publishing prevents this.
+- A pull that does not mention a record does not drop its preview, and neither does a reset snapshot that never contained it. The server may not have created the record when the pull read its view.
+- Each preview is a local write. A transaction that reads a streaming message and commits later can fail with a read-write conflict, as it would after a pull.
+
+The end-to-end test in [`packages/server/test/e2e/AgentChatStreaming.e2e.spec.ts`](../packages/server/test/e2e/AgentChatStreaming.e2e.spec.ts) implements this guide against a real `TandemServer`.

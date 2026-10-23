@@ -76,6 +76,7 @@ To sync between clients, pass a `remote`. See [Quickstart](docs/quickstart.md).
 - [Server](docs/server.md): run `TandemServer` and connect clients to it
 - [How sync works](docs/sync.md): mutations, push, pull, and rebase
 - [Custom remotes](docs/custom-remote.md): implement the `RemoteApi` contract yourself
+- [Agent chat](docs/agent-chat.md): stream agent replies with previews
 - [Roadmap](docs/roadmap.md)
 
 The full index is in [docs/README.md](docs/README.md).
