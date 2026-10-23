@@ -75,7 +75,8 @@ type SyncedRecordKey<
 }[Collection]
 
 type SyncClientState<Schema extends AnySchema> = {
-	poke?: ClientApi["poke"]
+	// Reconnects and tabs sharing a client identity can overlap connections.
+	pokes: Set<ClientApi["poke"]>
 	cookie?: Cookie
 	syncedRecordKeys?: SyncedRecordKey<Schema>[]
 }
@@ -186,16 +187,12 @@ export class TandemServer<
 	}
 
 	connect = ({ clientId, poke }: ClientApi) => {
-		const client = this.getSyncClient(clientId)
-		client.poke = poke
-		let disconnected = false
+		// Wrap so each connection unregisters only itself, even if callers reuse a callback.
+		const connection = () => poke()
+		this.getSyncClient(clientId).pokes.add(connection)
 
 		return Promise.resolve(() => {
-			if (disconnected) return Promise.resolve()
-			disconnected = true
-
-			const current = this.syncClients.get(clientId)
-			if (current?.poke === poke) current.poke = undefined
+			this.syncClients.get(clientId)?.pokes.delete(connection)
 			return Promise.resolve()
 		})
 	}
@@ -307,7 +304,7 @@ export class TandemServer<
 		const current = this.syncClients.get(clientId)
 		if (current) return current
 
-		const created: SyncClientState<Schema> = {}
+		const created: SyncClientState<Schema> = { pokes: new Set() }
 		this.syncClients.set(clientId, created)
 		return created
 	}
@@ -431,13 +428,13 @@ export class TandemServer<
 
 	private emitPokes() {
 		for (const client of this.syncClients.values()) {
-			if (!client.poke) continue
-
-			const result = errore.try(client.poke)
-			if (result instanceof Error) {
-				console.error(
-					new TandemServerError({ operation: "poke", cause: result }),
-				)
+			for (const poke of client.pokes) {
+				const result = errore.try(poke)
+				if (result instanceof Error) {
+					console.error(
+						new TandemServerError({ operation: "poke", cause: result }),
+					)
+				}
 			}
 		}
 	}

@@ -123,6 +123,8 @@ export class SyncEngine<Schema extends AnySchema> {
 	private readonly rng: RngApi
 
 	private disconnectFromRemote?: AsyncUnsubscribe
+	// Advances on disconnect so a connect still in flight unregisters when it resolves.
+	private connectionGeneration = 0
 	private scanWindow: ScanWindow<Schema> = []
 
 	get clientId(): ClientId {
@@ -173,6 +175,7 @@ export class SyncEngine<Schema extends AnySchema> {
 
 	private async connectToRemote() {
 		this.logger.info({ message: "connecting to remote" })
+		const generation = this.connectionGeneration
 		if (!this.db.isReady) await this.db.ready
 		// Clear can rotate identity during either await; connect the new durable session instead.
 		for (;;) {
@@ -196,11 +199,18 @@ export class SyncEngine<Schema extends AnySchema> {
 					cause: unsubscribe,
 				})
 			}
+			if (generation !== this.connectionGeneration) {
+				await unsubscribe()
+				return
+			}
 			if (clientId !== this.clientId) {
 				await unsubscribe()
 				continue
 			}
+			// Overlapping connect calls keep only the newest registration.
+			const previous = this.disconnectFromRemote
 			this.disconnectFromRemote = unsubscribe
+			await previous?.()
 
 			this.logger.info({ message: "connected to remote" })
 			return
@@ -209,8 +219,10 @@ export class SyncEngine<Schema extends AnySchema> {
 
 	async disconnect() {
 		this.logger.info({ message: "disconnecting from remote" })
-		await this.disconnectFromRemote?.()
+		this.connectionGeneration += 1
+		const unsubscribe = this.disconnectFromRemote
 		this.disconnectFromRemote = undefined
+		await unsubscribe?.()
 	}
 
 	subscribe(query: EncodedQuery<Schema>): Unsubscribe {
