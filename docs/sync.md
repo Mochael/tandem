@@ -66,7 +66,7 @@ const { cookie, patch, lastMutationId } = await remote.pull({
 
 ### Poke
 
-`connect` gives the remote a `poke` function. Calling it makes the client pull. The remote decides when to poke, for example over a WebSocket, SSE, or a polling timer.
+`connect` gives the remote a `poke` function. Calling it makes the client pull. The remote decides when to poke, for example over a WebSocket, SSE, or a polling timer. A poke is only a hint: it carries no data, and missing one delays a pull rather than losing changes. `connectTandemEventSource` pulls on every stream (re)connection and every 60 seconds, so lost pokes leave a client stale for at most that interval.
 
 ### Rebase
 
