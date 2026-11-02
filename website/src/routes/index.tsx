@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router"
+import { createFileRoute } from "@tanstack/react-router"
 import * as errore from "errore"
 import { Button, P, Prose, Text, iconSizeValues } from "maui"
 import { useEffect, useState } from "react"
@@ -27,7 +27,6 @@ async function loadStars() {
 }
 
 function Home() {
-	const navigate = useNavigate()
 	const [stars, setStars] = useState<number>()
 	useEffect(() => {
 		void loadStars().then((result) => {
@@ -71,7 +70,13 @@ function Home() {
 						</svg>
 						{stars === undefined ? "—" : stars.toLocaleString("en-US")}
 					</Button>
-					<Button onPress={() => navigate({ to: "/docs" })}>Docs</Button>
+					<Button
+						onPress={() =>
+							window.location.assign("https://docs.tandemsync.dev")
+						}
+					>
+						Docs
+					</Button>
 				</nav>
 			</header>
 			<main id="main" className="home-main">
@@ -83,7 +88,7 @@ function Home() {
 						variant="primary"
 						variantColor="teal"
 						onPress={() =>
-							navigate({ to: "/docs/$", params: { _splat: "quickstart" } })
+							window.location.assign("https://docs.tandemsync.dev/quickstart")
 						}
 					>
 						Get started

@@ -18,7 +18,9 @@ pnpm --filter @tandem/docs build
 PORT=3100 pnpm --filter @tandem/docs start
 ```
 
-Holocron serves the overview at `/overview`, the quickstart at `/quickstart`, and the remaining guides at their Markdown paths without `.md`. It also exposes `/llms.txt`, `/llms-full.txt`, and `/docs.zip`. Sidebar search filters page titles; it is not full-text search. The AI assistant is disabled. No hosted site or production domain is configured yet; the homepage's Docs button still opens its existing Maui reader.
+Holocron serves the overview at `/overview`, the quickstart at `/quickstart`, and the remaining guides at their Markdown paths without `.md`. It also exposes `/llms.txt`, `/llms-full.txt`, and `/docs.zip`. Sidebar search filters page titles; it is not full-text search. The AI assistant is disabled.
+
+The site runs on Vercel at [docs.tandemsync.dev](https://docs.tandemsync.dev). The `tandem-docs` project uses `docs` as its root directory, includes source files outside that directory, and runs Node.js 22. `vercel.json` sets the build command, serves static files, redirects `/` to `/overview`, and routes other requests to the built Holocron handler through `api/index.mjs`.
 
 ## Diagrams
 

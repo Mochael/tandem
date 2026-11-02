@@ -2,6 +2,8 @@
 
 TanStack Start + React + Maui. The home page lives at `/`; documentation lives at `/docs` and `/docs/<page>`.
 
+The homepage runs at [tandemsync.dev](https://tandemsync.dev). Its Docs and Get started buttons open the Holocron site at [docs.tandemsync.dev](https://docs.tandemsync.dev).
+
 Run from the repository root:
 
 ```sh
@@ -33,4 +35,4 @@ return <DocPage document={document} />
 
 Maui 0.0.62 reads `window.matchMedia` during provider initialization. The site therefore uses TanStack Start's SPA mode and mounts Maui inside `ClientOnly`. Page content requires JavaScript; the build prerenders a static shell, not the full documentation. Full SSR and prerendered page content need SSR-compatible Maui providers.
 
-`pnpm --filter @tandem/website build` writes static files to `website/dist/client`. Serve existing assets normally and rewrite other paths to `/_shell.html` so documentation deep links work. `website/vercel.json` supplies this configuration when a Vercel project uses `website` as its root directory and includes files outside the root directory (the shared `docs/`). No domain or deployment is configured.
+`pnpm --filter @tandem/website build` writes static files to `website/dist/client`. Serve existing assets normally and rewrite other paths to `/_shell.html` so documentation deep links work. `website/vercel.json` supplies this configuration. The Vercel project `tandem-website` uses `website` as its root directory, includes files outside that directory (the shared `docs/`), and runs Node.js 22.

@@ -70,6 +70,8 @@ To sync between clients, pass a `remote`. See [Quickstart](docs/quickstart.md).
 
 ## Documentation
 
+Visit [tandemsync.dev](https://tandemsync.dev) or read the guides at [docs.tandemsync.dev](https://docs.tandemsync.dev).
+
 - [Overview](docs/overview.md): what Tandem is and how the pieces fit together
 - [Quickstart](docs/quickstart.md): build a synced todo app
 - [Queries](docs/queries.md): query options and relations

@@ -1,0 +1,14 @@
+{
+	"$schema": "https://openapi.vercel.sh/vercel.json",
+	"framework": null,
+	"buildCommand": "pnpm --filter @tandem/docs build",
+	"outputDirectory": "dist/client",
+	"functions": {
+		"api/index.mjs": { "includeFiles": "dist/**" }
+	},
+	"routes": [
+		{ "src": "/", "status": 307, "headers": { "Location": "/overview" } },
+		{ "handle": "filesystem" },
+		{ "src": "/(.*)", "dest": "/api/index" }
+	]
+}

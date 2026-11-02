@@ -1,15 +1,7 @@
 import { expect, test } from "@playwright/test"
 
-test("read the docs from the home page and follow Markdown links", async ({
-	page,
-}) => {
-	await page.goto("/")
-	await page.getByRole("button", { name: "Get started", exact: true }).click()
-	await expect(
-		page.getByRole("heading", { name: "Quickstart", exact: true }),
-	).toBeVisible()
-	await page.goBack()
-	await page.getByRole("button", { name: "Docs", exact: true }).click()
+test("read the docs and follow Markdown links", async ({ page }) => {
+	await page.goto("/docs")
 	await expect(
 		page.getByRole("heading", { name: "Overview", exact: true }),
 	).toBeVisible()
