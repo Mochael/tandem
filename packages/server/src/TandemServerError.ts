@@ -4,6 +4,8 @@ export type TandemServerOperation =
 	| "cancel"
 	| "close"
 	| "commit"
+	| "connect"
+	| "disconnect"
 	| "poke"
 	| "pull"
 	| "push"

@@ -36,6 +36,8 @@ Across a network, the client's `remote` is a transport that forwards `push` and 
 
 After every commit that writes data, the server pokes each connected client.
 
+`createTandemEventStreamResponse` serves those pokes to browsers as server-sent events, and `connectTandemEventSource` from `@tanishqkancharla/tandem-core` turns them back into `poke` calls. Events carry no data; the client pulls over the normal transport. The stream sends `ready` after it registers, so the client pulls once per connection and catches writes it missed while disconnected. It also sends a keep-alive comment every 15 seconds and closes when the request aborts or the body is cancelled. The [Quickstart](quickstart.md#5-add-a-server) shows both sides.
+
 ## Read and write on the server
 
 Queries use the same object shape as the client (see [Queries](queries.md)), but return promises.
@@ -110,5 +112,5 @@ interface TandemServerStorageApi<Schema> {
 ## Limitations
 
 - Records are durable when storage is durable. Sync metadata (revisions, acknowledged mutation IDs, client scan windows) lives in the server process and resets on restart.
-- Pokes come from the `TandemServer` instance that committed the write. Writes made by other processes or directly to the database do not poke clients.
+- Pokes come from the `TandemServer` instance that committed the write, or from storage `subscribe` notifications. Writes made by other processes or directly to the database do not poke clients unless storage reports them. Event streams connected to another process miss those pokes and rely on the client's fallback pull.
 - The server does no authentication or authorization. Check requests in your transport before calling `push` or `pull`.

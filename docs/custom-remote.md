@@ -37,7 +37,7 @@ All of these types are exported from `@tanishqkancharla/tandem-core`. [How sync 
 
 Store `poke` for the client and call it whenever that client may have new data. Return a function that stops poking. The client calls `connect` on construction unless `autoConnect` is `false`, and it only pushes and pulls while connected.
 
-Any signal works: a WebSocket message, an SSE event, or a polling timer.
+Any signal works: a WebSocket message, an SSE event, or a polling timer. For SSE, return `connectTandemEventSource` from `connect` on the client, and serve the stream with `createTandemEventStreamResponse` (see [Server](server.md#connect-clients)). It accepts any object with `connect`, including the wrapper below.
 
 ## `push`
 
