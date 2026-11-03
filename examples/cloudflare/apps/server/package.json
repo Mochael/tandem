@@ -1,0 +1,29 @@
+{
+	"name": "@tandem/example-cloudflare",
+	"private": true,
+	"type": "module",
+	"description": "One Durable Object syncing existing D1 tables over SSE",
+	"scripts": {
+		"dev": "wrangler dev --port 8787",
+		"build": "wrangler deploy --dry-run --outdir dist",
+		"deploy": "wrangler deploy",
+		"type-check": "tsc --noEmit",
+		"lint": "oxlint src test --deny-warnings",
+		"format": "oxfmt src test package.json tsconfig.json wrangler.jsonc",
+		"test": "vitest run --config ../../../../vitest.config.js"
+	},
+	"dependencies": {
+		"@tanishqkancharla/tandem-core": "workspace:*",
+		"@tanishqkancharla/tandem-server": "workspace:*",
+		"errore": "^0.14.1"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^5.20261102.1",
+		"@types/node": "^26.6.6",
+		"esbuild": "^0.28.2",
+		"miniflare": "^4.20260730.0",
+		"typescript": "^7.0.2",
+		"vitest": "^5.1.0",
+		"wrangler": "^4.156.2"
+	}
+}
