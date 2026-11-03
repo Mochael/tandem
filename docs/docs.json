@@ -2,7 +2,8 @@
 	"$schema": "https://holocron.so/docs.json",
 	"name": "Tandem",
 	"description": "A sync engine and database for building collaborative apps.",
-	"logo": "/logo.svg",
+	"logo": { "light": "/logo.svg", "dark": "/logo-dark.svg" },
+	"favicon": "/favicon.svg",
 	"colors": {
 		"primary": "#0d9488",
 		"light": "#0d9488",
