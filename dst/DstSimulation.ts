@@ -1,4 +1,5 @@
 import type { MutationOp } from "@tanishqkancharla/tandem-core"
+import type { TandemServerStorageApi } from "@tanishqkancharla/tandem-server"
 import type { DstCoverage } from "./DstCoverage.js"
 import type { DstArtifactSink } from "./DstReplay.js"
 import { recover, type DstRecoveryResult } from "./DstRecovery.js"
@@ -112,10 +113,13 @@ export class DstSimulation {
 		this.options = resolveRunOptions(options)
 	}
 
-	async execute(sink?: DstArtifactSink): Promise<DstRunResult> {
+	async execute(
+		sink?: DstArtifactSink,
+		serverStorage?: TandemServerStorageApi<DstSchema>,
+	): Promise<DstRunResult> {
 		const { seed, steps } = this.options
 		sink?.write({ kind: "header", format: 1, options: this.options })
-		await using world = await DstWorld.start(this.options)
+		await using world = await DstWorld.start({ ...this.options, serverStorage })
 		// Drives choices only; ids come from their own streams.
 		const rng = new SimPrng(seed)
 		const trace: DstTraceRecord[] = []

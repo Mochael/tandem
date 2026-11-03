@@ -22,6 +22,11 @@
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js",
 			"default": "./dist/index.js"
+		},
+		"./sql": {
+			"types": "./dist/storage/TandemServerSqlStorage.d.ts",
+			"import": "./dist/storage/TandemServerSqlStorage.js",
+			"default": "./dist/storage/TandemServerSqlStorage.js"
 		}
 	},
 	"publishConfig": {
@@ -39,10 +44,14 @@
 	"dependencies": {
 		"@tanishqkancharla/tandem-core": "workspace:*",
 		"errore": "^0.14.1",
+		"kysely": "^0.29.8",
 		"tuple-database": "github:tanishqkancharla/tuple-database#ebe6b84edbc1371d0eb611cf5ca28d2f76be38db"
 	},
 	"devDependencies": {
+		"@electric-sql/pglite": "^0.5.14",
 		"@types/node": "^26.6.4",
+		"miniflare": "^4.20260730.0",
+		"mysql2": "^3.24.6",
 		"typescript": "^7.0.2",
 		"vitest": "^5.0.3"
 	}

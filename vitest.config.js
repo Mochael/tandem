@@ -6,6 +6,10 @@ export default defineConfig({
 	},
 	resolve: {
 		alias: {
+			"@tanishqkancharla/tandem-server/sql": new URL(
+				"./packages/server/src/storage/TandemServerSqlStorage.ts",
+				import.meta.url,
+			).pathname,
 			"@tanishqkancharla/tandem-core/internal": new URL(
 				"./packages/core/src/internal.ts",
 				import.meta.url,

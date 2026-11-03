@@ -154,18 +154,31 @@ export const dstCollections = [
 
 export type DstInventory = { [C in keyof DstSchema]: DstSchema[C][] }
 
-class InMemoryServerStorage implements TandemServerStorageApi<DstSchema> {
+class DstServerStorage implements TandemServerStorageApi<DstSchema> {
 	private readonly memory = new InMemoryTupleStorage()
+	private readonly external?: TandemServerStorageApi<DstSchema>
+
+	constructor(external?: TandemServerStorageApi<DstSchema>) {
+		this.external = external
+	}
 
 	/** Every value each server-owned record has had, in commit order; null when absent. */
 	readonly history = new Map(serverOwnedIds.map((id) => [id, ["null"]]))
 
 	scan(args?: ScanStorageArgs): Promise<TandemTuple<DstSchema>[]> {
+		if (this.external) return this.external.scan(args)
 		return Promise.resolve(this.memory.scan(args) as TandemTuple<DstSchema>[])
 	}
 
 	commit(writes: WriteOps<TandemTuple<DstSchema>>): Promise<void> {
+		if (this.external)
+			return this.external.commit(writes).then(() => this.recordHistory(writes))
 		this.memory.commit(writes)
+		this.recordHistory(writes)
+		return Promise.resolve()
+	}
+
+	private recordHistory(writes: WriteOps<TandemTuple<DstSchema>>) {
 		for (const { key, value } of writes.set ?? []) {
 			if (key[0] === "record" && key[1] === "tasks")
 				this.history.get(key[2])?.push(JSON.stringify(value))
@@ -174,10 +187,10 @@ class InMemoryServerStorage implements TandemServerStorageApi<DstSchema> {
 			if (key[0] === "record" && key[1] === "tasks")
 				this.history.get(key[2])?.push("null")
 		}
-		return Promise.resolve()
 	}
 
 	close(): Promise<void> {
+		if (this.external) return this.external.close()
 		this.memory.close()
 		return Promise.resolve()
 	}
@@ -610,7 +623,7 @@ export class DstWorld implements AsyncDisposable {
 	private readonly server: DstServer
 	private readonly harness: DstHarness
 	private readonly serverTimer: DstServerTimer
-	private readonly storage: InMemoryServerStorage
+	private readonly storage: DstServerStorage
 
 	private constructor({
 		server,
@@ -627,7 +640,7 @@ export class DstWorld implements AsyncDisposable {
 		server: DstServer
 		harness: DstHarness
 		clientNames: readonly DstClientName[]
-		storage: InMemoryServerStorage
+		storage: DstServerStorage
 		desired: DstWorld["desired"]
 		observations: DstWorld["observations"]
 		coverage: DstCoverage
@@ -650,17 +663,19 @@ export class DstWorld implements AsyncDisposable {
 		clientCount = 2,
 		initialSubscriptions = "full",
 		tabs = 0,
+		serverStorage,
 	}: {
 		seed: number
 		clientCount?: number
 		initialSubscriptions?: DstSubscriptionMode
 		tabs?: number
+		serverStorage?: TandemServerStorageApi<DstSchema>
 	}): Promise<DstWorld> {
 		const clientNames = Array.from(
 			{ length: clientCount },
 			(_, index): DstClientName => `client${index + 1}`,
 		)
-		const storage = new InMemoryServerStorage()
+		const storage = new DstServerStorage(serverStorage)
 		const serverTimer = new DstServerTimer()
 		const stats: DstStats = {
 			namedAppendCommits: 0,

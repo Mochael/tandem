@@ -18,6 +18,7 @@
 		"tuple-database": "github:tanishqkancharla/tuple-database#ebe6b84edbc1371d0eb611cf5ca28d2f76be38db"
 	},
 	"devDependencies": {
+		"@electric-sql/pglite": "^0.5.14",
 		"@types/node": "^26.6.4",
 		"tsx": "^4.23.15",
 		"typescript": "^7.0.2",

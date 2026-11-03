@@ -1,5 +1,7 @@
 import { appendFileSync, writeFileSync } from "node:fs"
 import type { DstRunOptions } from "./DstSimulation.js"
+import type { TandemServerStorageApi } from "@tanishqkancharla/tandem-server"
+import type { DstSchema } from "./DstWorld.js"
 import { recoveryOutcome, type DstRecoveryResult } from "./DstRecovery.js"
 import { isDeepStrictEqual } from "node:util"
 import {
@@ -96,8 +98,14 @@ export type DstReplayResult = {
  * Each event must apply exactly as recorded, including the boundary it acted
  * on and the ids it generated; otherwise the replay stops with a divergence.
  */
-export async function replay(artifact: DstArtifact): Promise<DstReplayResult> {
-	await using world = await DstWorld.start(artifact.options)
+export async function replay(
+	artifact: DstArtifact,
+	serverStorage?: TandemServerStorageApi<DstSchema>,
+): Promise<DstReplayResult> {
+	await using world = await DstWorld.start({
+		...artifact.options,
+		serverStorage,
+	})
 	const events = new Map(artifact.trace.map((record) => [record.step, record]))
 	const steps = Math.max(
 		artifact.outcome?.stepsCompleted ?? 0,

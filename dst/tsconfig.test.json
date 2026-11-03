@@ -4,12 +4,17 @@
 		"noEmit": true,
 		"types": ["node"],
 		"paths": {
+			"@tanishqkancharla/tandem-server/sql": [
+				"../packages/server/src/storage/TandemServerSqlStorage.ts"
+			],
 			"@tanishqkancharla/tandem-core": ["../packages/core/src/index.ts"],
 			"@tanishqkancharla/tandem-core/internal": [
 				"../packages/core/src/internal.ts"
 			],
 			"@tanishqkancharla/tandem-server": ["../packages/server/src/index.ts"],
-			"@tanishqkancharla/gatekeeper": ["../packages/gatekeeper/src/Gatekeeper.ts"]
+			"@tanishqkancharla/gatekeeper": [
+				"../packages/gatekeeper/src/Gatekeeper.ts"
+			]
 		}
 	},
 	"include": ["*.ts"],
