@@ -1,99 +1,140 @@
+import "@fontsource-variable/geist"
 import { createFileRoute } from "@tanstack/react-router"
 import * as errore from "errore"
-import { Button, P, Prose, Text, iconSizeValues } from "maui"
 import { useEffect, useState } from "react"
 
 export const Route = createFileRoute("/")({ component: Home })
 
-class GithubStarsError extends errore.createTaggedError({
-	name: "GithubStarsError",
-	message: "Could not load GitHub stars: $reason",
+const setupPrompt =
+	"Follow https://tandemsync.dev/setup.md to add Tandem sync to this project."
+
+class CopyPromptError extends errore.createTaggedError({
+	name: "CopyPromptError",
+	message: "Could not copy the setup prompt",
 }) {}
 
-async function loadStars() {
-	const response = await fetch(
-		"https://api.github.com/repos/tanishqkancharla/tandem",
-	).catch((cause) => new GithubStarsError({ reason: "Request failed", cause }))
-	if (response instanceof Error) return response
-	if (!response.ok)
-		return new GithubStarsError({ reason: `HTTP ${response.status}` })
-	const repository = await (
-		response.json() as Promise<{ stargazers_count: number }>
-	).catch(
-		(cause) => new GithubStarsError({ reason: "Invalid response", cause }),
-	)
-	if (repository instanceof Error) return repository
-	return repository.stargazers_count
-}
-
 function Home() {
-	const [stars, setStars] = useState<number>()
+	const [copy, setCopy] = useState<"idle" | "copied" | "failed">("idle")
 	useEffect(() => {
-		void loadStars().then((result) => {
-			if (result instanceof Error) {
-				console.warn(result.message)
-				return
-			}
-			setStars(result)
-		})
-	}, [])
+		if (copy === "idle") return
+		const timeout = setTimeout(() => setCopy("idle"), 2000)
+		return () => clearTimeout(timeout)
+	}, [copy])
+
+	async function copyPrompt() {
+		const result = await navigator.clipboard
+			.writeText(setupPrompt)
+			.catch((cause) => new CopyPromptError({ cause }))
+		if (result instanceof Error) {
+			console.warn(result.message, result.cause)
+			setCopy("failed")
+			return
+		}
+		setCopy("copied")
+	}
+
 	return (
 		<div className="home">
 			<header className="home-header">
-				<Text size="lg" fontWeight={600}>
+				<a className="home-brand" href="/">
+					<span className="home-mark" aria-hidden="true" />
 					Tandem
-				</Text>
+				</a>
 				<nav aria-label="Main" className="home-navigation">
-					<Button
-						variant="quiet"
-						aria-label={
-							stars === undefined
-								? "GitHub repository"
-								: `GitHub repository, ${stars} stars`
-						}
-						onPress={() =>
-							window.location.assign(
-								"https://github.com/tanishqkancharla/tandem",
-							)
-						}
+					<a href="https://docs.tandemsync.dev">
+						<svg
+							aria-hidden="true"
+							width="16"
+							height="16"
+							viewBox="0 0 16 16"
+							fill="none"
+							stroke="currentColor"
+							strokeWidth="1.4"
+							strokeLinejoin="round"
+						>
+							<path d="M2 3.2c1.9-.7 4-.6 6 .8v9.5c-2-1.4-4.1-1.5-6-.8z" />
+							<path d="M14 3.2c-1.9-.7-4-.6-6 .8v9.5c2-1.4 4.1-1.5 6-.8z" />
+						</svg>
+						Docs
+					</a>
+					<a
+						href="https://github.com/tanishqkancharla/tandem"
+						aria-label="GitHub"
 					>
 						{/* GitHub's Octicons mark-github-16 (MIT): https://github.com/primer/octicons */}
 						<svg
 							aria-hidden="true"
-							focusable="false"
-							width={iconSizeValues.sm}
-							height={iconSizeValues.sm}
+							width="16"
+							height="16"
 							viewBox="0 0 16 16"
 							fill="currentColor"
 						>
-							<path d="M6.766 11.328c-2.063-.25-3.516-1.734-3.516-3.656 0-.781.281-1.625.75-2.188-.203-.515-.172-1.609.063-2.062.625-.078 1.468.25 1.968.703.594-.187 1.219-.281 1.985-.281.765 0 1.39.094 1.953.265.484-.437 1.344-.765 1.969-.687.218.422.25 1.515.046 2.047.5.593.766 1.39.766 2.203 0 1.922-1.453 3.375-3.547 3.64.531.344.89 1.094.89 1.954v1.625c0 .468.391.734.86.547C13.781 14.359 16 11.53 16 8.03 16 3.61 12.406 0 7.984 0 3.563 0 0 3.61 0 8.031a7.88 7.88 0 0 0 5.172 7.422c.422.156.828-.125.828-.547v-1.25c-.219.094-.5.156-.75.156-1.031 0-1.64-.562-2.078-1.609-.172-.422-.36-.672-.719-.719-.187-.015-.25-.093-.25-.187 0-.188.313-.328.625-.328.453 0 .844.281 1.25.86.313.452.64.655 1.031.655s.641-.14 1-.5c.266-.265.47-.5.657-.656" />
+							<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" />
 						</svg>
-						{stars === undefined ? "—" : stars.toLocaleString("en-US")}
-					</Button>
-					<Button
-						onPress={() =>
-							window.location.assign("https://docs.tandemsync.dev")
-						}
-					>
-						Docs
-					</Button>
+						<span className="home-navigation-label">GitHub</span>
+					</a>
 				</nav>
 			</header>
 			<main id="main" className="home-main">
-				<article aria-label="About Tandem">
-					<Prose>
-						<P>A sync engine and database for building collaborative apps.</P>
-					</Prose>
-					<Button
-						variant="primary"
-						variantColor="teal"
-						onPress={() =>
-							window.location.assign("https://docs.tandemsync.dev/quickstart")
-						}
+				<h1>
+					Real-time sync,
+					<br />
+					no new infra
+				</h1>
+				<p>
+					Tandem is an open-source sync engine made of two libraries: a local
+					database for every client and a library for your server. Writes land
+					instantly, sync in the background, and your server stays the source of
+					truth.
+				</p>
+				<div className="home-start">
+					<button
+						type="button"
+						className="home-prompt"
+						title={setupPrompt}
+						onClick={() => void copyPrompt()}
 					>
-						Get started
-					</Button>
-				</article>
+						Add Tandem to my app
+						<span className="home-prompt-icon" aria-hidden="true">
+							{copy === "copied" ? (
+								<svg
+									width="15"
+									height="15"
+									viewBox="0 0 16 16"
+									fill="none"
+									stroke="currentColor"
+									strokeWidth="1.6"
+									strokeLinecap="round"
+									strokeLinejoin="round"
+								>
+									<path d="M3 8.5l3.2 3L13 4.5" />
+								</svg>
+							) : (
+								<svg
+									width="15"
+									height="15"
+									viewBox="0 0 16 16"
+									fill="none"
+									stroke="currentColor"
+									strokeWidth="1.4"
+								>
+									<rect x="5" y="5" width="8.5" height="8.5" rx="1.8" />
+									<path d="M10.5 5V3.8A1.8 1.8 0 0 0 8.7 2H3.8A1.8 1.8 0 0 0 2 3.8v4.9a1.8 1.8 0 0 0 1.8 1.8H5" />
+								</svg>
+							)}
+						</span>
+					</button>
+					<a className="home-docs-link" href="https://docs.tandemsync.dev">
+						Read the docs <span aria-hidden="true">→</span>
+					</a>
+				</div>
+				<p className="home-prompt-status" role="status">
+					{copy === "copied"
+						? "Copied. Paste it into your coding agent."
+						: copy === "failed"
+							? "Copy failed. Open tandemsync.dev/setup.md instead."
+							: ""}
+				</p>
 			</main>
 		</div>
 	)

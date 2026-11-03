@@ -2,7 +2,7 @@
 
 TanStack Start + React + Maui. The home page lives at `/`; documentation lives at `/docs` and `/docs/<page>`.
 
-The homepage runs at [tandemsync.dev](https://tandemsync.dev). Its Docs and Get started buttons open the Holocron site at [docs.tandemsync.dev](https://docs.tandemsync.dev).
+The homepage runs at [tandemsync.dev](https://tandemsync.dev). Its Docs link opens the Holocron site at [docs.tandemsync.dev](https://docs.tandemsync.dev). Its main button copies a prompt that tells a coding agent to follow [`public/setup.md`](public/setup.md), served at [tandemsync.dev/setup.md](https://tandemsync.dev/setup.md).
 
 Run from the repository root:
 

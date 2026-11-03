@@ -15,11 +15,11 @@ export const Route = createRootRoute({
 		meta: [
 			{ charSet: "utf-8" },
 			{ name: "viewport", content: "width=device-width, initial-scale=1" },
-			{ title: "Tandem — A sync engine and database for collaborative apps" },
+			{ title: "Tandem — Real-time sync, no new infra" },
 			{
 				name: "description",
 				content:
-					"A local-first sync engine and database for collaborative apps. Typed queries, live subscriptions, and React bindings.",
+					"Tandem is an open-source sync engine made of two libraries: a local database for every client and a library for your server.",
 			},
 		],
 		links: [{ rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
