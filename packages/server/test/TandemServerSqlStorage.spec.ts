@@ -146,7 +146,13 @@ for (const dialect of ["sqlite", "postgres", "mysql"] as const) {
 			test("reads existing rows and preserves application columns on update", async () => {
 				await db.commit([
 					{
-						sql: "insert into app_tasks (task_id, task_text, is_done, audit_note) values ('a', 'Existing', 0, 'Owned by app')",
+						sql: "alter table app_tasks add column owner_id varchar(255) not null",
+						parameters: [],
+					},
+				])
+				await db.commit([
+					{
+						sql: "insert into app_tasks (task_id, task_text, is_done, audit_note, owner_id) values ('a', 'Existing', 0, 'Owned by app', 'owner-1')",
 						parameters: [],
 					},
 				])
@@ -164,6 +170,7 @@ for (const dialect of ["sqlite", "postgres", "mysql"] as const) {
 						task_text: "Edited",
 						is_done: 1,
 						audit_note: "Owned by app",
+						owner_id: "owner-1",
 					},
 				])
 			})

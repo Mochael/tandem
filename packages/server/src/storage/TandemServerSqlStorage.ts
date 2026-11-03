@@ -90,7 +90,6 @@ export class TandemServerSqlStorage<
 > implements TandemServerStorageApi<Schema> {
 	private readonly clients = new InMemoryTupleStorage()
 	private readonly compiler: Kysely<unknown>
-	private readonly dialect: TandemSqlDialect
 	private readonly tables: Array<
 		[CollectionName<Schema>, TandemSqlTable<Schema[CollectionName<Schema>]>]
 	>
@@ -98,7 +97,6 @@ export class TandemServerSqlStorage<
 	private readonly commitSql: TandemServerSqlStorageArgs<Schema>["commit"]
 
 	constructor(args: TandemServerSqlStorageArgs<Schema>) {
-		this.dialect = args.dialect
 		this.compiler = new Kysely({
 			dialect: {
 				...compilers[args.dialect],
@@ -210,34 +208,24 @@ export class TandemServerSqlStorage<
 			)
 			const insert = sql`insert into ${sql.id(table.table)} (${sql.join(entries.map(([column]) => sql.id(column)))})`
 			const values = sql.join(entries.map(([, value]) => sql.val(value)))
-			if (this.dialect === "mysql") {
-				// ON DUPLICATE KEY could update a different record on another unique
-				// column. Match only the primary key, inside the host's atomic batch.
-				const where = sql.join(
-					table.idColumns.map(
-						(column) => sql`${sql.id(column)} = ${columns[column]}`,
-					),
-					sql` and `,
-				)
-				if (fields.length)
-					statements.push(
-						sql`update ${sql.id(table.table)} set ${sql.join(fields.map(([column, value]) => sql`${sql.id(column)} = ${value}`))} where ${where}`.compile(
-							this.compiler,
-						),
-					)
+			// Update by primary key first: an INSERT ... ON CONFLICT can reject
+			// existing rows whose required, app-owned columns are not mapped.
+			const where = sql.join(
+				table.idColumns.map(
+					(column) => sql`${sql.id(column)} = ${columns[column]}`,
+				),
+				sql` and `,
+			)
+			if (fields.length)
 				statements.push(
-					sql`${insert} select ${values} where not exists (select 1 from ${sql.id(table.table)} where ${where})`.compile(
+					sql`update ${sql.id(table.table)} set ${sql.join(fields.map(([column, value]) => sql`${sql.id(column)} = ${value}`))} where ${where}`.compile(
 						this.compiler,
 					),
 				)
-				continue
-			}
-			const updates = fields.map(
-				([column]) => sql`${sql.id(column)} = ${sql.id("excluded", column)}`,
-			)
-			const conflict = sql`on conflict (${sql.join(table.idColumns.map((column) => sql.id(column)))}) ${updates.length ? sql`do update set ${sql.join(updates)}` : sql`do nothing`}`
 			statements.push(
-				sql`${insert} values (${values}) ${conflict}`.compile(this.compiler),
+				sql`${insert} select ${values} where not exists (select 1 from ${sql.id(table.table)} where ${where})`.compile(
+					this.compiler,
+				),
 			)
 		}
 		return statements
